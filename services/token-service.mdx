@@ -1,0 +1,190 @@
+---
+title: "Hedera Token Service (HTS)"
+description: "Native fungible tokens and NFTs with full lifecycle management, KYC, freeze controls, custom fees, and atomic transfers."
+keywords: ["HTS", "token service", "fungible token", "NFT", "token lifecycle", "KYC", "freeze", "custom fees", "CryptoTransfer"]
+---
+
+The Hedera Token Service (HTS) enables the creation and management of first-class native tokens on the Hedera network. Unlike ERC-20 or ERC-721 tokens on EVM chains, HTS tokens are a native network primitive — they require no smart contract, benefit from the same fee predictability and throughput as HBAR, and settle with hashgraph finality.
+
+<Note>
+The Token Service module also hosts **CryptoService** — the service responsible for account creation, HBAR transfers, and allowance management. Both are exposed from the same `hedera-token-service` module through separate `RpcServiceDefinition` entries (`CryptoServiceDefinition` and `TokenServiceDefinition`).
+</Note>
+
+## Token types
+
+| Type | Description |
+|---|---|
+| **Fungible** | Interchangeable units with a configurable decimal precision and max supply |
+| **Non-fungible (NFT)** | Unique serial-numbered tokens; each serial is distinct and carries individual metadata |
+
+## Token lifecycle
+
+<Steps>
+  <Step title="Create">
+    Define the token's properties — name, symbol, treasury account, supply type, decimals, and optional keys (admin, KYC, freeze, wipe, supply, fee schedule, pause).
+  </Step>
+  <Step title="Associate">
+    Before receiving a token, an account must opt in via `TokenAssociateToAccount`. This prevents unsolicited token delivery.
+  </Step>
+  <Step title="Mint">
+    Increase supply (fungible) or create new NFT serials. Requires the `supplyKey` signature.
+  </Step>
+  <Step title="Transfer">
+    Move tokens between accounts using `CryptoTransfer`. A single transfer transaction can atomically move HBAR, fungible tokens, and NFTs across multiple accounts.
+  </Step>
+  <Step title="Burn">
+    Permanently reduce supply (fungible) or destroy specific NFT serials. Requires the `supplyKey` signature.
+  </Step>
+  <Step title="Wipe">
+    Remove tokens from a specific account without returning them to the treasury. Requires the `wipeKey` signature.
+  </Step>
+  <Step title="Delete">
+    Mark a token as deleted. Requires the `adminKey`. The token can no longer be minted or transferred after deletion.
+  </Step>
+</Steps>
+
+## Transaction types
+
+### TokenCreate
+
+Defines a new token. Key fields:
+
+```protobuf
+message TokenCreateTransactionBody {
+  string name = 1;                   // Display name
+  string symbol = 2;                 // Ticker symbol
+  uint32 decimals = 3;               // Precision for fungible tokens
+  uint64 initialSupply = 4;          // Fungible: units minted to treasury at creation
+  AccountID treasury = 5;            // Receives initial supply and fees
+  Key adminKey = 6;                  // Controls updates and deletion
+  Key kycKey = 7;                    // Required for KYC grant/revoke
+  Key freezeKey = 8;                 // Required to freeze/unfreeze accounts
+  Key wipeKey = 9;                   // Required to wipe account balances
+  Key supplyKey = 10;                // Required to mint and burn
+  bool freezeDefault = 11;           // New associations start frozen if true
+  Key feeScheduleKey = 12;           // Controls custom fee updates
+  repeated CustomFee customFees = 13;
+  TokenType tokenType = 14;          // FUNGIBLE_COMMON or NON_FUNGIBLE_UNIQUE
+  TokenSupplyType supplyType = 15;   // INFINITE or FINITE
+  int64 maxSupply = 16;              // Upper bound when supplyType = FINITE
+  Key pauseKey = 17;                 // Required to pause/unpause the token
+  string memo = 18;
+  repeated TokenKeyValidation tokenKeyValidation = 19;
+}
+```
+
+### TokenMint
+
+Increases supply or creates NFT serials:
+
+```protobuf
+message TokenMintTransactionBody {
+  TokenID token = 1;
+  int64 amount = 2;          // Fungible: units to add
+  repeated bytes metadata = 3; // NFT: one entry per new serial
+}
+```
+
+### TokenBurn
+
+Destroys supply permanently:
+
+```protobuf
+message TokenBurnTransactionBody {
+  TokenID token = 1;
+  int64 amount = 2;             // Fungible: units to remove from treasury
+  repeated int64 serialNumbers = 3; // NFT: serials to destroy
+}
+```
+
+### TokenAssociateToAccount
+
+Opts an account into receiving a token:
+
+```protobuf
+message TokenAssociateTransactionBody {
+  AccountID account = 1;
+  repeated TokenID tokens = 2;
+}
+```
+
+### CryptoTransfer
+
+Atomically moves HBAR, fungible tokens, and NFTs in a single transaction:
+
+```protobuf
+message CryptoTransferTransactionBody {
+  TransferList transfers = 1;                  // HBAR debits and credits
+  repeated TokenTransferList tokenTransfers = 2; // Token debits, credits, and NFT ownership changes
+}
+```
+
+A single `CryptoTransfer` can include up to 10 token types and up to 20 individual HBAR adjustments. All debits and credits must net to zero across each denomination.
+
+<Tip>
+`CryptoTransfer` is the recommended way to move both HBAR and tokens. It is also callable from within smart contracts via the HTS system contract, enabling atomic cross-token swaps entirely on-chain.
+</Tip>
+
+## Token controls
+
+### KYC
+
+When a token is created with a `kycKey`, new token associations start in a "KYC not granted" state. The token cannot be transferred to or from an account until KYC is explicitly granted:
+
+- `TokenGrantKycToAccount` — grants KYC; requires `kycKey` signature
+- `TokenRevokeKycFromAccount` — revokes KYC; requires `kycKey` signature
+
+### Freeze
+
+When a token has a `freezeKey`, individual accounts can be frozen to block transfers:
+
+- `TokenFreezeAccount` — blocks transfers; requires `freezeKey` signature
+- `TokenUnfreezeAccount` — unblocks transfers; requires `freezeKey` signature
+- Setting `freezeDefault = true` at creation makes every new association start in the frozen state
+
+### Pause
+
+A token with a `pauseKey` can be paused globally to halt all transfers network-wide:
+
+- `TokenPause` — pauses the token; requires `pauseKey` signature
+- `TokenUnpause` — resumes the token; requires `pauseKey` signature
+
+### Custom fees
+
+Tokens can define fees assessed automatically at transfer time. Three fee types are supported:
+
+| Fee type | Denominated in | Description |
+|---|---|---|
+| Fixed fee | HBAR or another token | A flat amount per transfer |
+| Fractional fee | The transferred token | A fraction of the amount transferred |
+| Royalty fee | HBAR (for NFT exchanges) | A percentage of the HBAR exchanged for an NFT |
+
+Custom fees are defined at creation and can only be updated by the holder of the `feeScheduleKey`.
+
+## Service module layout
+
+| Module | Role |
+|---|---|
+| `hedera-token-service` | `TokenService`, `CryptoServiceDefinition`, `TokenServiceDefinition`, readable stores for tokens, NFTs, accounts, and relationships |
+| `hedera-token-service-impl` | All handlers (`TokenCreateHandler`, `TokenMintHandler`, `CryptoTransferHandler`, etc.), writable stores, and schema migrations |
+
+```java
+TokenService ts = TokenService.getInstance();
+```
+
+## Use cases
+
+<AccordionGroup>
+  <Accordion title="Asset tokenization">
+    Represent real-world assets — securities, commodities, real estate shares — as fungible tokens with configurable supply caps and KYC/freeze controls.
+  </Accordion>
+  <Accordion title="NFTs and digital collectibles">
+    Mint unique serial-numbered tokens with per-serial metadata. Royalty fees ensure creators receive a percentage of secondary market sales.
+  </Accordion>
+  <Accordion title="Loyalty programs">
+    Issue loyalty points as fungible tokens. Custom fractional fees can automatically route a portion of each redemption to the program operator.
+  </Accordion>
+  <Accordion title="Stablecoins and regulated assets">
+    Use freeze and KYC keys to comply with regulatory requirements, freezing individual accounts or revoking KYC without affecting the broader token ecosystem.
+  </Accordion>
+</AccordionGroup>

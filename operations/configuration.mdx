@@ -1,0 +1,145 @@
+---
+title: "Configuration"
+description: "Understand the four property types and three configuration files that control a Hiero consensus node, and learn how to override them at runtime."
+---
+
+Hiero consensus node configuration is built from four distinct property types, each with its own scope, lifecycle, and override mechanism. Understanding which type a property belongs to determines how and when you can change it.
+
+## Property types
+
+<AccordionGroup>
+  <Accordion title="Bootstrap properties">
+    Bootstrap properties are consumed only once, at **network genesis**, to initialise the system accounts and system files that every new network requires. After genesis they are never read again.
+
+    **Example:** `bootstrap.throttleDefsJson.resource` points to the JSON file used to initialise the throttle definitions in system file `0.0.123`.
+
+    Override these before the very first node start by placing a `data/config/bootstrap.properties` file on every node in the network. Because this file is read at genesis on all nodes, it must be identical across the network — any inconsistency will result in divergent state and an unusable network.
+
+    ```properties
+    # data/config/bootstrap.properties — example: use relaxed throttles for integration testing
+    bootstrap.throttleDefsJson.resource=throttles-dev.json
+    ```
+
+    <Warning>
+      A `data/config/bootstrap.properties` override file has **no effect after genesis**. It is safe to remove it once the network is running.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="Static properties">
+    Static properties are used throughout the network's lifetime but change rarely or never. Changing them requires a coordinated network restart because they affect consensus processing on all nodes.
+
+    **Example:** `accounts.systemAdmin` is the account number granted administrative privileges such as updating system files without key signatures.
+
+    Like bootstrap properties, static properties can be overridden before startup via `data/config/bootstrap.properties`. The file name is the same — the node distinguishes property types internally.
+  </Accordion>
+
+  <Accordion title="Dynamic properties">
+    Dynamic properties can be changed while the network is running without a restart. The current values are stored in system file `0.0.121` (identified by the static property `files.networkProperties`). To change a dynamic property, submit a `FileUpdate` transaction to file `0.0.121` with a `ServicesConfigurationList` payload signed by an authorised admin account.
+
+    **Example:** `tokens.maxPerAccount` limits how many HTS tokens an account may be associated with at any one time.
+
+    The initial values for dynamic properties come from `data/config/application.properties` at genesis. **After genesis, editing this file has no effect** — all updates must go through a `FileUpdate`.
+
+    ```properties
+    # data/config/application.properties — sets genesis values for dynamic properties
+    balances.exportDir.path=data/accountBalances/
+    ```
+  </Accordion>
+
+  <Accordion title="Node properties">
+    Node properties affect only the individual node on which they are set; they have no impact on consensus and do not need to be the same on all nodes.
+
+    **Example:** `hedera.recordStream.logDir` controls where record stream files are written on that specific node. `netty.mode` controls whether the gRPC server runs in `PROD` or `TEST` mode.
+
+    Place node-specific overrides in `data/config/node.properties`. This file is re-read on every node restart.
+
+    ```properties
+    # data/config/node.properties — example node-specific overrides
+    hedera.recordStream.logDir=data/recordStreams
+    hedera.recordStream.sidecarDir=
+    netty.mode=PROD
+    blockStream.blockFileDir=data/blockStreams
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Property sources and precedence
+
+The node resolves property values from multiple sources in the following order (later sources win):
+
+1. **Compiled-in defaults** — `bootstrap.properties` bundled inside the application JAR.
+2. **`data/config/bootstrap.properties`** — On-disk overrides for bootstrap and static properties (genesis only).
+3. **System file `0.0.121`** — Live overrides for dynamic properties (post-genesis).
+4. **`data/config/node.properties`** — Per-node overrides read on every startup.
+
+<Info>
+  Property-based configuration does not include the network's address book, fee schedules, exchange rates, HAPI permissions, or throttle definitions. Each of those is managed through its own system file.
+</Info>
+
+## Changing dynamic properties at runtime
+
+Dynamic properties live in system file `0.0.121`. To update them, submit a `FileUpdate` transaction targeting that file with a `ServicesConfigurationList` protobuf payload.
+
+Only authorised accounts may update system files. The table below shows the relevant accounts and which system files they can update:
+
+| Account | Role | Can update |
+|---------|------|-----------|
+| `0.0.2` | Treasury | All system files |
+| `0.0.50` | System admin | All system files |
+| `0.0.55` | Address book admin | `0.0.101`, `0.0.102`, `0.0.121`, `0.0.122`, `0.0.123` |
+| `0.0.57` | Exchange rates admin | `0.0.112`, `0.0.121`, `0.0.122`, `0.0.123` |
+
+The `FileUpdate` payload must be a serialised `ServicesConfigurationList` message. Use any Hedera SDK to construct and submit the transaction:
+
+```java
+// Java SDK example — update a dynamic property
+var update = new FileUpdateTransaction()
+    .setFileId(new FileId(0, 0, 121))
+    .setContents(buildServicesConfigurationList(
+        "tokens.maxPerAccount", "2000"
+    ));
+```
+
+<Note>
+  To disable automated congestion pricing set `fees.percentCongestionMultipliers=1,1x` in the `ServicesConfigurationList`. See the [fees](/operations/fees) page for details.
+</Note>
+
+## Key configuration categories
+
+The properties are organised by category. The table below lists the most operator-relevant categories and representative keys.
+
+| Category | Key examples | Notes |
+|----------|-------------|-------|
+| **Accounts** | `accounts.systemAdmin`, `accounts.treasury` | System account numbers; static, set at genesis |
+| **Files** | `files.networkProperties`, `files.feeSchedules` | System file numbers; static |
+| **Ledger** | `ledger.id`, `ledger.numReservedSystemEntities` | Network identity and reserved ID range |
+| **Balances** | `balances.exportDir.path`, `balances.exportEnabled` | Account balance snapshot export |
+| **Tokens** | `tokens.maxPerAccount`, `tokens.maxSymbolUtf8Bytes` | HTS token limits; dynamic |
+| **Contracts** | `contracts.maxGasPerSec`, `contracts.maxKvPairs.aggregate` | EVM execution limits; dynamic |
+| **Fees** | `fees.minCongestionPeriod`, `fees.percentCongestionMultipliers` | Congestion pricing; dynamic |
+| **Throttles** | `bootstrap.throttleDefsJson.resource` | Initial throttle JSON; bootstrap |
+| **Netty / gRPC** | `netty.mode`, `netty.prod.keepAliveTime` | Transport settings; node |
+| **Record stream** | `hedera.recordStream.logDir`, `hedera.recordStream.sidecarDir` | Output paths; node |
+
+## System files reference
+
+| File ID | Static property name | Content |
+|---------|---------------------|---------|
+| `0.0.101` | `files.addressBook` | Network address book |
+| `0.0.102` | `files.nodeDetails` | Node details |
+| `0.0.111` | `files.feeSchedules` | Fee schedule |
+| `0.0.112` | `files.exchangeRates` | ℏ/USD exchange rate |
+| `0.0.121` | `files.networkProperties` | Dynamic network properties |
+| `0.0.122` | `files.hapiPermissions` | HAPI permission overrides |
+| `0.0.123` | `files.throttleDefinitions` | Throttle bucket definitions |
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card title="Throttling" icon="gauge" href="/operations/throttling">
+    Configure per-operation TPS limits and gas-based throttles.
+  </Card>
+  <Card title="Fees" icon="receipt" href="/operations/fees">
+    Understand fee components, the fee schedule, and congestion pricing.
+  </Card>
+</CardGroup>

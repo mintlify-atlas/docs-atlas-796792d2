@@ -1,0 +1,179 @@
+---
+title: "Testing"
+description: "Understand the four test types in Hiero Consensus Node and how they fit into the CI/CD pipeline."
+keywords: ["testing", "unit tests", "integration tests", "hammer tests", "benchmarks", "jmh", "ci", "gradle"]
+---
+
+## Overview
+
+The project defines four distinct test types, each with its own source set, Gradle task, and execution context. Knowing which type to write — and when each type runs in CI — helps keep the test suite fast, reliable, and meaningful.
+
+## Test types
+
+<AccordionGroup>
+  <Accordion title="Unit tests — src/test">
+    Unit tests are the foundation of the test suite. They exercise a single class or small group of collaborating classes in isolation, with no external processes or I/O.
+
+    **Source location:** `src/test` within each module
+
+    **Gradle task:**
+    ```bash
+    ./gradlew :<module>:test
+    ```
+
+    **When they run:** On every pull request. Unit tests must pass before a PR can be merged.
+
+    **Requirements:**
+    - Must never be flaky. Avoid arbitrary waits, `Thread.sleep`, or timeouts.
+    - The full unit test suite across the entire repository should complete in roughly 5 minutes.
+    - The vast majority of tests in the codebase should be unit tests (tens of thousands).
+
+    Unit tests are the cheapest and most reliable signal you can add. When in doubt, write a unit test first.
+  </Accordion>
+
+  <Accordion title="Integration tests — src/testIntegration">
+    Integration tests verify that two or more components work together correctly. They may spin up real infrastructure such as databases or external services using containers.
+
+    **Source location:** `src/testIntegration` within each module
+
+    **Gradle task:**
+    ```bash
+    ./gradlew :<module>:itest
+    ```
+
+    **When they run:** On every pull request. All integration tests must pass before merging to `main`.
+
+    **Requirements:**
+    - Use [Testcontainers](https://www.testcontainers.org/) for databases, mirror nodes, block explorers, or any component that lives in a separate repository.
+    - Per-module execution time must not exceed 10 minutes.
+    - Tests must be deterministic — if a test fails, it must indicate a real problem, not a timing artifact.
+    - The repository should contain thousands of integration tests.
+
+    <Warning>
+      Flaky integration tests erode confidence in the entire pipeline. Write integration tests carefully and fix flakiness immediately when it appears.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="Hammer tests — src/hammer">
+    Hammer tests (also called fuzzing or stress tests) exercise a component under pseudo-random, high-volume conditions over an extended period. They are designed to surface edge cases that deterministic tests miss.
+
+    **Source location:** `src/hammer` within each module
+
+    **Gradle task:**
+    ```bash
+    ./gradlew :<module>:hammer
+    ```
+
+    **When they run:** Nightly, as part of the Extended Test Suite (XTS).
+
+    **Behavior:**
+    - Run for an extended duration and attempt to use a component in as many ways as possible.
+    - Have concrete pass/fail criteria. If a hammer test fails, it indicates a definite bug that must be triaged.
+    - Are not suitable for PR builds due to their runtime length.
+  </Accordion>
+
+  <Accordion title="Micro-benchmarks — src/jmh">
+    Micro-benchmarks measure the performance characteristics of specific code paths. They use the Java Microbenchmark Harness (JMH) and are designed for A/B comparisons, not absolute pass/fail thresholds.
+
+    **Source location:** `src/jmh` within each module
+
+    **Gradle task:**
+    ```bash
+    ./gradlew :<module>:jmh
+    ```
+
+    **When they run:** Nightly. Results are recorded over time to enable trend analysis.
+
+    **How to use them:**
+    - Run relevant benchmarks locally before submitting a PR that touches performance-sensitive code.
+    - Compare A vs. B implementations on the same hardware — do not rely on absolute numbers, which vary by machine.
+    - Use the [JMH IntelliJ plugin](https://plugins.jetbrains.com/plugin/7529-jmh-java-microbenchmark-harness) to run individual benchmarks from the IDE.
+
+    <Info>
+      Micro-benchmark results are not a pass/fail gate. Their value comes from comparison and trend tracking, not from any single run in isolation.
+    </Info>
+  </Accordion>
+</AccordionGroup>
+
+## Test type comparison
+
+| | Unit | Integration | Hammer | Micro-benchmark |
+|---|---|---|---|---|
+| **Source set** | `src/test` | `src/testIntegration` | `src/hammer` | `src/jmh` |
+| **Gradle task suffix** | `:test` | `:itest` | `:hammer` | `:jmh` |
+| **Runs on PR** | Yes | Yes | No | No |
+| **Runs nightly** | Yes | Yes | Yes | Yes |
+| **Pass/fail gate** | Yes | Yes | Yes | No |
+| **Expected count** | Tens of thousands | Thousands | Dozens | As needed |
+| **Max per-module runtime** | ~5 min total | 10 min | Extended | Extended |
+
+## CI/CD pipeline
+
+The project uses a two-tier CI model: the Minimal Acceptable Test Suite (MATS) runs on every pull request, and the Extended Test Suite (XTS) runs against the `main` branch on a recurring schedule.
+
+### MATS — runs on every PR
+
+MATS includes unit tests and integration tests. It is designed to complete within **30 minutes**, giving you fast feedback on the impact of your changes before merging.
+
+When you open a pull request, add the appropriate labels to trigger the right checks:
+
+| Label | Purpose |
+|-------|---------|
+| `CI:UnitTests` | Triggers unit test checks required for merging |
+| `CI:FullStackTests` | Triggers full-stack PR checks required for merging |
+| `CI:FinalChecks` | Triggers final checks required for merging |
+
+### XTS — runs against main every 3 hours
+
+XTS runs test cases that cannot complete within the 30-minute MATS window. It covers:
+
+- Hammer tests
+- Timing-sensitive tests
+- Long-running HAPI end-to-end tests
+
+XTS is designed to complete within a **3-hour window**. It runs automatically against the latest commit on `main` whenever a new commit is present.
+
+### Dry-running XTS before merging
+
+You can run the full XTS suite against your branch before merging using the **XTS Dry Run** workflow. This is strongly encouraged for changes that touch performance-sensitive or concurrency-sensitive code.
+
+Trigger the dry run with the GitHub CLI:
+
+```bash
+cd hiero-consensus-node
+gh workflow run ./.github/workflows/flow-dry-run-extended-test-suite.yaml \
+  -f commit_sha=$(git rev-parse HEAD) \
+  -f branch_name='your-branch-name'
+```
+
+Or use the GitHub Actions UI under **Actions → [CITR] XTS Dry Run**, selecting `main` as the workflow source and supplying your commit SHA and branch name.
+
+<Tip>
+  Run the XTS Dry Run before merging any PR that modifies consensus logic, state management, or platform internals. Catching issues before they land on `main` avoids disrupting the nightly run for the entire team.
+</Tip>
+
+## Running tests locally
+
+### Single module
+
+```bash
+# Unit tests for a specific module
+./gradlew :hedera-node:test
+
+# Integration tests for a specific module
+./gradlew :hedera-node:itest
+
+# Hammer tests for a specific module
+./gradlew :hedera-node:hammer
+
+# JMH benchmarks for a specific module
+./gradlew :hedera-node:jmh
+```
+
+### All quality checks
+
+```bash
+./gradlew qualityGate
+```
+
+This runs `assemble`, all unit tests, and all static analysis checks. Run it before pushing to ensure your changes will pass CI.

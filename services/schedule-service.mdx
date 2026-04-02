@@ -1,0 +1,158 @@
+---
+title: "Schedule Service"
+description: "Deferred and multi-signature transactions that accumulate required signatures and execute once the threshold is met or at a specified expiration time."
+keywords: ["schedule service", "ScheduleCreate", "ScheduleSign", "ScheduleDelete", "multi-signature", "deferred transactions", "scheduled transactions"]
+---
+
+The Hedera Schedule Service allows clients to create a **scheduled transaction** — a network entity that holds a transaction body and accumulates the required signatures before executing. This enables multi-party authorization workflows where multiple independent parties must approve an action before it takes effect, even if they sign at different times.
+
+## How scheduled transactions work
+
+<Steps>
+  <Step title="Create the schedule">
+    One party submits a `ScheduleCreate` transaction containing the inner transaction body to be scheduled. The network stores the schedule and returns a `ScheduleID`. The creator's signature is automatically counted toward the signing requirements.
+  </Step>
+  <Step title="Collect signatures">
+    Any party that needs to sign the inner transaction submits a `ScheduleSign` transaction referencing the `ScheduleID`. Their signature is added to the schedule's accumulated signature set.
+  </Step>
+  <Step title="Execute automatically">
+    Once the accumulated signatures satisfy the signing requirements of the inner transaction, the scheduled transaction executes at the **next consensus event**. No additional action is required.
+  </Step>
+  <Step title="Expiry or deletion">
+    If signatures are never fully collected, the schedule expires at its `expiration_time` (default: 30 minutes after creation, configurable up to a network maximum). Schedules can also be explicitly deleted by the holder of the `adminKey`.
+  </Step>
+</Steps>
+
+<Note>
+By default, a schedule executes as soon as all required signatures are collected (`wait_for_expiry = false`). Set `wait_for_expiry = true` to force evaluation only at the `expiration_time`, regardless of when signatures arrive.
+</Note>
+
+## Schedulable transaction types
+
+Not all transaction types can be scheduled. The network maintains a whitelist controlled by the `scheduling.whitelist` system property. Currently supported schedulable types include:
+
+- `CryptoTransfer`
+- `ConsensusSubmitMessage`
+- `TokenMint`
+- `TokenBurn`
+- `CryptoApproveAllowance`
+
+Additional types will be added in future releases.
+
+<Warning>
+`ScheduleCreate` and `ScheduleSign` cannot themselves be scheduled (`UNSCHEDULABLE_TRANSACTION`).
+</Warning>
+
+## Transaction types
+
+### ScheduleCreate
+
+Creates a new schedule entity on the network:
+
+```protobuf
+message ScheduleCreateTransactionBody {
+  SchedulableTransactionBody scheduledTransactionBody = 1; // The inner transaction to execute
+  string memo = 2;                  // UTF-8, max 100 bytes
+  Key adminKey = 3;                 // Optional; required to delete the schedule
+  AccountID payerAccountID = 4;     // Account charged at execution time;
+                                    // defaults to the ScheduleCreate payer
+  Timestamp expiration_time = 5;    // When the schedule expires; default 30 min
+  bool wait_for_expiry = 13;        // If true, execute only at expiration_time
+}
+```
+
+The `scheduledTransactionBody` wraps the inner transaction. It carries a `transactionFee` (maximum the executor is willing to pay) and a `memo`:
+
+```protobuf
+message SchedulableTransactionBody {
+  uint64 transactionFee = 1;
+  string memo = 2;
+  oneof data {
+    CryptoTransferTransactionBody cryptoTransfer = 14;
+    ConsensusSubmitMessageTransactionBody consensusSubmitMessage = 27;
+    TokenMintTransactionBody tokenMint = 37;
+    TokenBurnTransactionBody tokenBurn = 38;
+    CryptoApproveAllowanceTransactionBody cryptoApproveAllowance = 49;
+    // ... additional whitelisted types
+  }
+}
+```
+
+### ScheduleSign
+
+Adds signatures from one or more additional signers to an existing schedule:
+
+```protobuf
+message ScheduleSignTransactionBody {
+  ScheduleID scheduleID = 1;   // The schedule to sign
+}
+```
+
+The transaction must be signed by the keys being added. If the new signatures complete the threshold, the scheduled transaction executes immediately (unless `wait_for_expiry = true`).
+
+### ScheduleDelete
+
+Cancels a schedule before it executes. Requires the `adminKey` set at creation:
+
+```protobuf
+message ScheduleDeleteTransactionBody {
+  ScheduleID scheduleID = 1;
+}
+```
+
+Schedules without an `adminKey` are immutable — they cannot be deleted, only expired.
+
+## Query types
+
+### ScheduleGetInfo
+
+Returns full metadata for a schedule, including creator, payer, creation time, inner transaction body, accumulated signatories, and whether the schedule has been executed or deleted:
+
+```protobuf
+message ScheduleGetInfoQuery {
+  QueryHeader header = 1;
+  ScheduleID scheduleID = 2;
+}
+```
+
+## Schedule IDs
+
+A `ScheduleID` follows the same `<shard>.<realm>.<num>` format as all Hedera entity IDs (e.g. `0.0.98765`). Both shard and realm default to `0` on the current network.
+
+## Signature deduplication
+
+The network detects when two `ScheduleCreate` transactions submit identical inner transaction bodies (all fields except `scheduledPayerAccountID`). If an identical schedule already exists and is pending, the second `ScheduleCreate` fails with `IDENTICAL_SCHEDULE_ALREADY_CREATED`.
+
+## Throttling considerations
+
+Because scheduled transactions execute at a future consensus time, the network must ensure that their execution does not violate throttle or gas limits at that time:
+
+- If executing the scheduled transaction would exceed the **gas limit** at the scheduled expiration time, creation fails with `SCHEDULE_FUTURE_GAS_LIMIT_EXCEEDED`.
+- If it would exceed **TPS throttles** at the scheduled time, creation fails with `SCHEDULE_FUTURE_THROTTLE_EXCEEDED`.
+
+## Service module layout
+
+| Module | Role |
+|---|---|
+| `hedera-schedule-service` | `ScheduleService` interface, `ScheduleServiceDefinition`, `ReadableScheduleStore` |
+| `hedera-schedule-service-impl` | `ScheduleCreateHandler`, `ScheduleSignHandler`, `ScheduleDeleteHandler`, `ScheduleGetInfoHandler`, writable stores, schema migrations |
+
+## Use cases
+
+<AccordionGroup>
+  <Accordion title="Multi-party authorization">
+    A treasury transfer that requires approval from three of five executives. Each executive independently submits a `ScheduleSign` transaction from their own device and time zone. The transfer executes automatically once the threshold is met.
+  </Accordion>
+  <Accordion title="Escrow and time-locked payments">
+    Set `wait_for_expiry = true` with a future `expiration_time` to create a payment that cannot execute before a specific date, even if all parties sign immediately. The schedule acts as a time-locked escrow.
+  </Accordion>
+  <Accordion title="Recurring workflows">
+    Off-chain automation creates a new `ScheduleCreate` at each cycle. The relevant signers (validators, custodians, oracles) submit `ScheduleSign` transactions, and execution happens automatically when consensus is reached.
+  </Accordion>
+  <Accordion title="Governance proposals">
+    A DAO governance contract creates a scheduled token transfer representing a grant payment. Token holders holding the required keys vote by submitting `ScheduleSign` transactions. The payment executes only if a quorum is reached before expiration.
+  </Accordion>
+  <Accordion title="Cross-chain atomic coordination">
+    A bridge operator schedules an HBAR release contingent on signatures from multiple bridge validators. The scheduled transaction provides an auditable, on-chain record of the multi-party authorization process.
+  </Accordion>
+</AccordionGroup>

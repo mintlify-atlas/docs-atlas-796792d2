@@ -1,0 +1,209 @@
+---
+title: "Platform Configuration"
+description: "The swirlds-config-api layered configuration system: sources, typed records, validation, and metrics/Prometheus integration."
+keywords: ["configuration", "config api", "swirlds-config-api", "ConfigData", "ConfigProperty", "settings", "metrics", "prometheus"]
+---
+
+The Platform SDK uses `swirlds-config-api` — a zero-dependency, layered configuration library — to configure every module from the base utilities up to the application services. Configuration is assembled at startup from multiple **sources** (classpath defaults, property files, environment variables, and more), merged by priority, and exposed to code through strongly-typed Java records.
+
+## Architecture
+
+The API is split across two modules:
+
+| Module | Purpose |
+|---|---|
+| `swirlds-config-api` (`com.swirlds.config.api`) | Public API with zero external dependencies. All code that reads configuration depends only on this module. |
+| `swirlds-config-impl` (`com.swirlds.config.impl`) | Runtime implementation. Should only appear as a runtime (not compile-time) dependency. Loaded via the Java SPI. |
+
+Additional modules in `swirlds-config-extensions` provide ready-made config source implementations (`PropertyFileConfigSource`, `SystemEnvironmentConfigSource`, `YamlConfigSource`, `ClasspathFileConfigSource`, etc.) and validation helpers.
+
+<Info>
+  Because the implementation is resolved through the Java SPI at runtime, the underlying implementation can be swapped without changing any application code.
+</Info>
+
+## Lifecycle
+
+Configuration is immutable once built. You assemble it before the application starts, and any attempt to modify sources after calling `build()` throws `IllegalStateException`.
+
+```java
+// 1. Register sources, converters, validators, and record types
+Configuration config = ConfigurationBuilder.create()
+        .withSource(new ClasspathFileConfigSource(Path.of("app.properties")))
+        .withSource(new PropertyFileConfigSource(Path.of("config/node.properties")))
+        .withSource(new SystemEnvironmentConfigSource())
+        .withConfigDataType(GossipConfig.class)
+        .withConfigDataType(MetricsConfig.class)
+        .build(); // validation runs here; throws ConfigViolationException on failure
+
+// 2. Use it
+GossipConfig gossip = config.getConfigData(GossipConfig.class);
+```
+
+## Config sources and priority
+
+Each source implements `ConfigSource` and returns an **ordinal** number. A source with a higher ordinal overwrites properties provided by sources with a lower ordinal. The built-in constants in `ConfigSourceOrdinalConstants` are:
+
+| Source type | Ordinal |
+|---|---|
+| Programmatic / defaults | 10 |
+| Legacy `settings.txt` file | 100 |
+| Property files | 200 |
+| System environment variables | 300 |
+| JVM system properties | 400 |
+
+System properties therefore win over everything else, which is useful for per-node overrides in containerised deployments.
+
+<Tip>
+  Assign a custom ordinal above 400 if you need a source that cannot be overridden by system properties (for example, a mandatory cluster-wide policy source).
+</Tip>
+
+## Typed config records
+
+The preferred way to consume configuration is via **config data records** — standard Java records annotated with `@ConfigData` and `@ConfigProperty`. The `ConfigurationBuilder` registers each record type; at `build()` time the framework creates a single immutable instance that is returned by `config.getConfigData(MyConfig.class)`.
+
+### Defining a record
+
+```java
+import com.swirlds.config.api.ConfigData;
+import com.swirlds.config.api.ConfigProperty;
+import com.swirlds.config.api.validation.annotation.Min;
+import com.swirlds.config.api.validation.annotation.Positive;
+import java.time.Duration;
+import java.util.List;
+
+@ConfigData("gossip")
+public record GossipConfig(
+        @ConfigProperty(defaultValue = "2500") int syncProtocolPermitCount,
+        @ConfigProperty(defaultValue = "false") boolean broadcastEnabled,
+        @ConfigProperty(defaultValue = "1s") Duration broadcastSelfEventDelay,
+        @ConfigProperty(defaultValue = "250ms") Duration broadcastAncestorDelay,
+        @ConfigProperty(defaultValue = "3s") Duration broadcastOtherDelay,
+        @Min(1) @Positive int networkSize) {}
+```
+
+The `@ConfigData("gossip")` prefix means the framework looks for properties named `gossip.syncProtocolPermitCount`, `gossip.broadcastEnabled`, and so on in the config sources.
+
+### Reading a record
+
+```java
+GossipConfig gossip = config.getConfigData(GossipConfig.class);
+
+if (gossip.broadcastEnabled()) {
+    log.info("Broadcast enabled — self-event delay: {}", gossip.broadcastSelfEventDelay());
+}
+```
+
+### Low-level access
+
+If you need to read a property without defining a record you can use the raw API:
+
+```java
+// Read a required string property
+String nodeId = config.getValue("node.id");
+
+// Read with a default
+boolean debug = config.getValue("app.debug", Boolean.TYPE, false);
+
+// Read a typed list
+List<Integer> errorCodes = config.getValues("app.errorCodes", Integer.TYPE);
+```
+
+## Validation
+
+Constraint annotations are evaluated at `build()` time. If any constraint is violated, a `ConfigViolationException` is thrown with the full list of violations before the application starts.
+
+```java
+@ConfigData("state")
+public record StateConfig(
+        @Positive int roundsToKeep,
+        @Min(0) @Max(100) int snapshotRetentionPercent,
+        boolean debugStackTracesEnabled) {}
+```
+
+Available built-in constraints: `@Positive`, `@Negative`, `@Min`, `@Max`, and `@ConstraintMethod` for custom logic.
+
+## Custom sources, converters, and validators
+
+<Tabs>
+  <Tab title="Custom source">
+    Implement `ConfigSource` to pull properties from any backend (database, remote config service, etc.):
+
+    ```java
+    public class VaultConfigSource implements ConfigSource {
+
+        @Override
+        public Set<String> getPropertyNames() {
+            return vault.listSecrets("platform/");
+        }
+
+        @Override
+        public String getValue(String propertyName) {
+            return vault.readSecret(propertyName);
+        }
+
+        @Override
+        public int getOrdinal() {
+            return 500; // override everything else
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Custom converter">
+    Implement `ConfigConverter<T>` to teach the framework about a new type:
+
+    ```java
+    public class NodeIdConverter implements ConfigConverter<NodeId> {
+
+        @Override
+        public NodeId convert(String value) {
+            if (value == null) throw new NullPointerException("value must not be null");
+            return NodeId.of(Long.parseLong(value));
+        }
+    }
+
+    // Register when building the configuration
+    Configuration config = ConfigurationBuilder.create()
+            .withConverter(new NodeIdConverter())
+            .build();
+    ```
+  </Tab>
+  <Tab title="Custom validator">
+    Implement `ConfigValidator` to check cross-property invariants:
+
+    ```java
+    public class FreezeTimeValidator implements ConfigValidator {
+
+        @Override
+        public Stream<ConfigViolation> validate(Configuration configuration) {
+            if (!configuration.exists("freeze.time")) return Stream.empty();
+            // example: ensure freeze time is in the future
+            ZonedDateTime ft = configuration.getValue("freeze.time", ZonedDateTime.class);
+            if (!ft.isAfter(ZonedDateTime.now())) {
+                return Stream.of(new DefaultConfigViolation(
+                        "freeze.time", ft.toString(), "freeze.time must be in the future"));
+            }
+            return Stream.empty();
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Metrics and Prometheus integration
+
+Platform metrics use a companion API (`swirlds-metrics-api`) with the same layered design. Each platform instance owns a `Metrics` object scoped to that instance; a separate global `Metrics` object captures JVM-wide counters (heap, GC, crypto).
+
+The `SnapshotService` periodically samples all registered metrics and forwards snapshots to output backends. The built-in Prometheus backend exposes a scrape endpoint; no additional configuration is required to enable it beyond including `swirlds-metrics-impl` on the runtime classpath.
+
+```java
+// Registering a custom counter — the platform provides the Metrics instance via PlatformContext
+Counter txnCount = metrics.getOrCreate(
+        new Counter.Config("app", "transactionsHandled")
+                .withDescription("Total post-consensus transactions handled"));
+
+txnCount.increment();
+```
+
+<Note>
+  Two metrics with the same `category` and `name` but different types, or one global and one per-platform, will conflict. The `MetricRegistry` enforces uniqueness across all `Metrics` instances and throws an exception on registration conflict.
+</Note>

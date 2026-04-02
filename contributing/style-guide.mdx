@@ -1,0 +1,178 @@
+---
+title: "Style Guide"
+description: "Java coding standards and conventions for contributing to Hiero Consensus Node."
+keywords: ["style guide", "java", "coding standards", "formatting", "javadoc", "naming", "spotless", "checkstyle"]
+---
+
+## Overview
+
+This project follows a derivative of the [Google Java Style Guide](https://google.github.io/styleguide/javaguide.html) with modifications specific to Hedera development. Formatting is enforced automatically — running `./gradlew qualityGate` applies Spotless and Checkstyle, so most formatting violations are fixed for you before they can reach CI.
+
+<Info>
+  Use `./gradlew qualityGate` or the [Google Java Format IntelliJ plugin](https://github.com/google/google-java-format#intellij-android-studio-and-other-jetbrains-ides) to format code before pushing. Unformatted code fails CI checks.
+</Info>
+
+## Source file structure
+
+Every Java source file must contain the following sections in order, each separated by exactly one blank line:
+
+1. License or copyright header (if applicable)
+2. Package statement
+3. Import statements
+4. Exactly one top-level class
+
+### Encoding
+
+All source files must be encoded in **UTF-8**. Tab characters are not used for indentation — use spaces only.
+
+### Imports
+
+- No wildcard imports (`import com.example.*` is not allowed)
+- Static imports appear first in a single block, followed by non-static imports in a separate block
+- Within each block, imports are sorted in ASCII order
+- Static import is not used for static nested classes
+
+## Formatting
+
+### Indentation and column limit
+
+- Block indentation: **+4 spaces** per level
+- Column limit: **120 characters**
+- Continuation lines: indented at least **+8 spaces** from the original line
+
+### Braces
+
+Braces follow the K&R ("Egyptian brackets") style for all non-empty blocks:
+
+```java
+// Correct
+if (condition()) {
+    doSomething();
+} else {
+    doSomethingElse();
+}
+
+// Correct — empty block
+void doNothing() {}
+```
+
+Braces are required for all `if`, `else`, `for`, `do`, and `while` statements, even single-statement bodies. The only exception is lambda expressions, where braces remain optional.
+
+### One statement per line
+
+Each statement must be followed by a line break. Do not chain multiple statements on a single line.
+
+### Variable declarations
+
+- Declare one variable per declaration (`int a, b;` is not allowed)
+- Declare local variables close to their first use, not at the top of a block
+
+## Naming conventions
+
+| Identifier type | Convention | Examples |
+|-----------------|------------|---------|
+| Package | Lowercase letters and digits, no underscores | `com.hedera.node.app` |
+| Class / Interface | UpperCamelCase | `TransactionHandler`, `FeeCalculator` |
+| Method | lowerCamelCase, verb or verb phrase | `sendMessage()`, `calculateFee()` |
+| Constant (`static final`) | UPPER\_SNAKE\_CASE | `MAX_RETRIES`, `DEFAULT_TIMEOUT` |
+| Non-constant field | lowerCamelCase | `computedValues`, `nodeIndex` |
+| Parameter | lowerCamelCase | `accountId`, `transactionBody` |
+| Local variable | lowerCamelCase | `result`, `retryCount` |
+| Type parameter | Single capital letter or class-name + `T` | `E`, `T`, `RequestT` |
+
+<Warning>
+  Do not use Hungarian notation or special prefixes/suffixes such as `m`, `s_`, `k`, or trailing underscores. These are explicitly not permitted.
+</Warning>
+
+### Camel case for acronyms
+
+Treat acronyms as ordinary words when constructing identifiers. For example, use `XmlHttpRequest` not `XMLHTTPRequest`, and `newCustomerId` not `newCustomerID`.
+
+### Test class naming
+
+Test classes end with `Test`. For a class named `FeeCalculator`, the unit test class is `FeeCalculatorTest`.
+
+Test method names use lowerCamelCase with underscores to separate logical components: `transferMoney_deductsFromSource`.
+
+## Annotations
+
+This project uses **SpotBugs annotations** exclusively for nullability and other static analysis hints. Do not use annotations from `javax.annotation` or `org.jetbrains.annotations`.
+
+```java
+// Correct — SpotBugs annotation
+final @NonNull String accountId;
+
+// Not allowed — javax.annotation
+@javax.annotation.Nonnull String accountId;
+```
+
+Always use `@Override` when overriding a superclass method or implementing an interface method. The only exception is when the parent method is `@Deprecated`.
+
+Modifier order follows the Java Language Specification:
+
+```
+public protected private abstract default static final transient volatile synchronized native strictfp
+```
+
+## Javadoc
+
+At minimum, every `public` class and every `public` or `protected` member must have a Javadoc comment. Private implementation details can be documented with regular implementation comments (`//`).
+
+### Formatting rules
+
+- Begin each Javadoc block with a summary fragment — a noun or verb phrase, not a full sentence starting with "This method..."
+- Block tags appear in the order: `@param`, `@return`, `@throws`, `@deprecated`
+- No tag should have an empty description
+
+```java
+/**
+ * Returns the account balance at the given consensus time.
+ *
+ * @param accountId the account to query
+ * @param consensusTime the point in time to query
+ * @return the balance in tinybars, or zero if the account does not exist
+ * @throws IllegalArgumentException if {@code accountId} is null
+ */
+long getBalanceAt(AccountID accountId, Instant consensusTime);
+```
+
+<Tip>
+  A common mistake is writing `/** @return the customer ID */`. The correct form is `/** Returns the customer ID. */` — the summary fragment comes first.
+</Tip>
+
+## Error handling
+
+Caught exceptions must not be silently ignored. At minimum, log the exception or rethrow it as an `AssertionError` if it is theoretically impossible. If ignoring an exception is truly justified, explain why in a comment on the catch block.
+
+```java
+try {
+    int value = Integer.parseInt(input);
+    return handleNumeric(value);
+} catch (NumberFormatException ok) {
+    // input is not numeric — fall through to text handling
+}
+return handleText(input);
+```
+
+In tests, a caught exception may be ignored without comment when the variable name starts with `expected`.
+
+## Static members
+
+Always qualify a reference to a static member using the class name, not an instance reference:
+
+```java
+// Correct
+FeeCalculator.DEFAULT_FEE;
+
+// Not allowed
+myCalculator.DEFAULT_FEE;
+```
+
+## Formatting enforcement
+
+Formatting is enforced by two tools, both run as part of `./gradlew qualityGate`:
+
+- **Spotless** — applies Google Java Format to auto-fix whitespace and ordering issues
+- **Checkstyle** — enforces structural rules such as import ordering and Javadoc presence
+
+If a Spotless violation is detected, the build auto-fixes it in place. Commit the reformatted files and re-run `qualityGate` to verify. Checkstyle violations must be fixed manually.

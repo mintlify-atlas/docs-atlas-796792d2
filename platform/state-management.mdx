@@ -1,0 +1,90 @@
+---
+title: "State Management"
+description: "How ledger state is represented as a Merkle tree, snapshotted, signed, and recovered after a node falls behind."
+keywords: ["merkle", "virtualmap", "merkledb", "state signing", "ISS", "fast copy", "reconnect", "signed state"]
+---
+
+Every node maintains an identical in-memory representation of the ledger as a **Merkle tree**. After each consensus round the platform hashes the tree, collects signatures from peers, and periodically writes a signed snapshot to disk. The same snapshots drive reconnect recovery when a node falls behind.
+
+## Merkle tree structure
+
+The ledger state is a tree of `MerkleNode` objects. Internal nodes are immutable once hashed; leaf nodes hold the actual data (account balances, topic messages, smart-contract storage slots, etc.). The tree has two main node types:
+
+| Node type | Purpose |
+|---|---|
+| `MerkleInternal` | Intermediate tree nodes that aggregate child hashes. |
+| `MerkleLeaf` | Terminal nodes that hold serialisable application data. |
+
+The application layer reads and writes state through SPI entry points:
+- `SwirldState` — the application's mutable state object. The platform passes it post-consensus transaction batches to process.
+- `DualState` — a lightweight companion object shared between the platform and the application for a small set of cross-cutting values (such as the freeze timestamp).
+
+<Note>
+  The application never holds a direct reference to the platform's copy of the state tree. All access goes through the `SwirldState` handle that the platform provides to `handleTransaction`. This ensures correct concurrency and reference-count lifecycle.
+</Note>
+
+## Fast copy (copy-on-write)
+
+Snapshotting a large Merkle tree on every round would be prohibitively expensive. The platform uses **fast copy** semantics instead:
+
+1. When a snapshot is needed, the platform calls `copy()` on the root node.
+2. The copy is logically independent and can be hashed or written to disk on a background thread.
+3. Both the original and the copy share immutable subtrees. A subtree is only duplicated when one of the copies needs to mutate it (copy-on-write).
+4. Leaf nodes track a **reference count**. A node is eligible for garbage collection only when its count drops to zero.
+
+<Warning>
+  Reference counts must be managed precisely. Holding a `SignedState` without taking an explicit reservation via `SignedState.reserve("reason")` is unsafe — the state may be asynchronously deleted as soon as all reservations are released. Always use `ReservedSignedState` in a try-with-resources block.
+</Warning>
+
+## VirtualMap
+
+For datasets too large to fit comfortably in a JVM heap (hundreds of millions of account records, token associations, or contract storage slots), the platform provides `VirtualMap` — a virtual Merkle leaf backed by **MerkleDB** on disk.
+
+`VirtualMap` presents the same `MerkleLeaf` interface as any other tree node, so the platform hashes and signs it identically. Internally:
+
+- **Hot data** — recently accessed key-value pairs are held in an in-memory cache.
+- **Cold data** — the remainder is stored in MerkleDB, a purpose-built, append-only key-value store optimised for Merkle hashing. MerkleDB stores data in a series of immutable data files with an in-memory index, avoiding random writes.
+- **Fast copy** — `VirtualMap` fast-copy is cheap: the copy shares the same MerkleDB files and only diverges as mutations accumulate.
+
+## State signing and ISS detection
+
+After each round that reaches consensus, the platform:
+
+1. Computes the root hash of the Merkle state tree (recursively, bottom-up).
+2. Signs the root hash with the node's private key and creates a **state signature transaction** that is gossiped to all peers.
+3. Collects signatures from other nodes. Once a sufficient threshold of valid signatures is gathered, the `SignedState` is considered complete.
+
+**Inconsistent state signatures (ISS)** occur when two nodes produce different root hashes for the same round. An ISS means the nodes diverged — a serious bug. When the platform detects an ISS it logs a high-severity alert and halts the node to prevent a split-brain scenario from persisting.
+
+<Note>
+  The configuration property `state.debugStackTracesEnabled` enables extended reference-count diagnostics. Set it only in development environments; it has a significant performance cost.
+</Note>
+
+## State snapshots
+
+The platform writes `SignedState` snapshots to disk at a configurable interval. Snapshots serve three purposes:
+
+1. **Restart recovery** — on startup the node loads the most recent snapshot and replays only the events from the pre-consensus event stream that follow it.
+2. **Reconnect source** — a node that is fully caught-up can serve its latest snapshot to a lagging peer.
+3. **Audit trail** — signed snapshots provide a verifiable record of ledger state at a given round.
+
+Old snapshots are deleted automatically once they are no longer needed for reconnect or audit purposes.
+
+## Reconnect
+
+When a node falls too far behind the network (detected via the gossip protocol's generation-number exchange), the platform transitions to `BEHIND` and initiates a reconnect:
+
+<Steps>
+  <Step title="Select a teacher node">
+    The lagging node (the *learner*) selects a peer that is caught up (the *teacher*) and requests its latest signed state.
+  </Step>
+  <Step title="Transfer the Merkle tree">
+    The teacher streams the Merkle tree to the learner using a hashed, Merkle-proof-based protocol. Only the subtrees that differ from what the learner already has need to be transferred.
+  </Step>
+  <Step title="Verify and persist">
+    Once the learner has assembled the full tree and verified the root hash against the collected peer signatures, it writes the state to disk. It must do this before creating any new events, ensuring that a valid replay starting point always exists on disk.
+  </Step>
+  <Step title="Resume gossiping">
+    The platform transitions to `RECONNECT_COMPLETE`, resumes gossip, and eventually transitions back to `CHECKING` and then `ACTIVE` once it is caught up.
+  </Step>
+</Steps>

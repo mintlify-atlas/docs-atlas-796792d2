@@ -1,0 +1,88 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "Hiero Consensus Node",
+  "projectDescription": "A distributed ledger consensus node providing crypto, token, consensus, file, and smart contract services for Hiero-based networks using the hashgraph consensus algorithm.",
+  "theme": "aspen",
+  "primaryColor": "#f5e6de",
+  "lightColor": "#8c7c7c",
+  "darkColor": "#4f4a47",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Core Services",
+            "pages": [
+              "services/overview",
+              "services/consensus-service",
+              "services/token-service",
+              "services/smart-contract-service",
+              "services/file-service",
+              "services/schedule-service"
+            ]
+          },
+          {
+            "group": "Platform SDK",
+            "pages": [
+              "platform/overview",
+              "platform/gossip-consensus",
+              "platform/state-management",
+              "platform/configuration"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/deployment",
+              "operations/configuration",
+              "operations/throttling",
+              "operations/fees",
+              "operations/monitoring"
+            ]
+          },
+          {
+            "group": "Contributing",
+            "pages": [
+              "contributing/development-setup",
+              "contributing/testing",
+              "contributing/style-guide"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Hashgraph consensus algorithm for fast, fair, and secure transaction ordering",
+    "Hedera Consensus Service (HCS) for decentralized, tamper-proof event logs",
+    "Hedera Token Service (HTS) supporting fungible tokens and NFTs",
+    "EVM-compatible smart contract execution via Hedera Smart Contract Service",
+    "Decentralized file storage via Hedera File Service (HFS)",
+    "Scheduled transaction execution with conditional workflows",
+    "gRPC API (HAPI) for client interaction with the network",
+    "Modular service architecture with well-defined SPI boundaries",
+    "Platform SDK providing gossip, state management, metrics, and configuration",
+    "Record stream and event stream generation for auditability"
+  ],
+  "publicApiSurface": [
+    "CryptoService (account creation, transfer, update, delete)",
+    "ConsensusService (topic creation, message submission)",
+    "TokenService (token creation, minting, burning, transfers)",
+    "SmartContractService (contract deployment and execution via Solidity)",
+    "FileService (file create, update, delete, append)",
+    "ScheduleService (scheduled transaction creation and signing)",
+    "NetworkService (account and network info queries)",
+    "AddressBookService (node management)",
+    "UtilService (utility operations like PRNG)",
+    "HAPI gRPC endpoints (transactions and queries)"
+  ]
+}

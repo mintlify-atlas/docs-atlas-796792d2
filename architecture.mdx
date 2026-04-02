@@ -1,0 +1,305 @@
+---
+title: "Architecture"
+description: "High-level architecture of the Hiero Consensus Node: two-layer design, module dependency structure, the SPI pattern, and the transaction lifecycle."
+keywords: ["architecture", "platform sdk", "hashgraph", "hedera-app", "hedera-app-spi", "SPI", "transaction lifecycle", "modules", "gossip"]
+---
+
+A Hiero Consensus Node is structured in two layers: the **Platform SDK** handles gossip, hashgraph consensus, and merkle state management; the **Hedera application layer** implements service logic on top of the platform. The dependency arrow is strictly one-directional — application modules depend on the platform, but the platform has no knowledge of the application.
+
+## Two-layer design
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Hedera Application                    │
+│  hedera-app · service modules · hedera-app-spi (SPI)    │
+├─────────────────────────────────────────────────────────┤
+│                      Platform SDK                        │
+│        Base · Core (gossip/hashgraph) · Data            │
+└─────────────────────────────────────────────────────────┘
+```
+
+This boundary means platform components can be tested, upgraded, and evolved independently of any Hedera service logic.
+
+### Platform SDK (`platform-sdk/`)
+
+The Platform SDK provides all the infrastructure needed for Byzantine fault-tolerant consensus. It is organized into three sub-layers.
+
+<AccordionGroup>
+  <Accordion title="Base — configuration, logging, metrics">
+    Common utilities shared across the entire node:
+
+    - **Configuration** — a unified configuration system consumed by all other layers
+    - **Logging** — structured logging used throughout the platform and application
+    - **Metrics** — Prometheus-compatible metric primitives, including busy-time metrics
+    - **Thread management** — helpers for named, monitored threads
+    - **Null-handling and toString utilities** — lightweight helpers for safe, readable code
+    - **Test support** — shared test infrastructure for unit testing platform components
+
+    These components have no dependencies on Core or Data and can be used in isolation.
+  </Accordion>
+  <Accordion title="Core — gossip, hashgraph, and event flow">
+    The distributed consensus engine:
+
+    - **Gossip** — nodes continuously sync events with peers using either the sync-gossip protocol or the out-of-order gossip (OOG) protocol
+    - **Hashgraph** — the consensus algorithm that uses virtual voting to produce a fair, tamper-proof transaction ordering without a leader or additional voting rounds
+    - **Event flow** — events pass through intake, pre-consensus streaming, and post-consensus streaming pipelines on dedicated threads
+    - **State management** — signed state snapshots are produced, hashed, and signed cooperatively by all nodes; ISS (Invalid State Signature) detection guards against divergence
+    - **Reconnect** — a lagging node can catch up by downloading a recent signed state from a peer
+    - **Freeze** — a controlled shutdown and restart sequence used during software upgrades
+    - **Application communication** — the platform notifies the application layer when a round of transactions has reached consensus
+
+    The Core layer determines the canonical ordering of every transaction submitted to the network.
+  </Accordion>
+  <Accordion title="Data — Merkle trees and VirtualMap">
+    The persistent data structures that hold ledger state:
+
+    - **Merkle APIs** — fast-copy semantics, mutability controls, reference counting, hashing, and serialization
+    - **VirtualMap** — a virtual (lazy-loading) Merkle map backed by **MerkleDB** on disk; designed to hold large datasets (such as millions of accounts) without loading all data into memory at once
+    - **Reconnect support** — efficient state transfer using Merkle diffs
+
+    Fast-copy semantics mean the platform can hash, sign, and snapshot a previous immutable version of the tree while the application writes to the current mutable copy — without blocking between the two operations.
+  </Accordion>
+</AccordionGroup>
+
+### Hedera application (`hedera-node/`)
+
+The application layer implements all Hedera service logic. It is composed of multiple modules with a strict dependency hierarchy.
+
+## Module dependency structure
+
+`hedera-app` sits at the top of the tree. It depends on all service implementation modules; no other module depends on it.
+
+```
+hedera-app
+    ├── hedera-token-service-impl
+    ├── hedera-consensus-service-impl
+    ├── hedera-smart-contract-service-impl
+    ├── hedera-file-service-impl
+    ├── hedera-network-admin-service-impl
+    ├── hedera-schedule-service-impl
+    ├── hedera-util-service-impl
+    └── hedera-addressbook-service-impl
+         │   (each impl depends on its own API module)
+         ├── hedera-token-service
+         ├── hedera-consensus-service
+         ├── hedera-smart-contract-service
+         ├── hedera-file-service
+         ├── hedera-network-admin-service
+         ├── hedera-schedule-service
+         ├── hedera-util-service
+         └── hedera-addressbook-service
+              │   (each API module depends on the SPI)
+              └── hedera-app-spi
+                       └── platform-sdk
+```
+
+<Note>
+  Because `hedera-app` is the only module that depends on implementation modules, you can compile and test any service without touching `hedera-app`. The full node is only assembled at the top of the tree.
+</Note>
+
+### Key modules
+
+<CardGroup cols={2}>
+  <Card title="hedera-app" icon="cube">
+    Main entry point and application orchestrator. Owns the `Hedera` class, gRPC server lifecycle, platform integration, state management, fee engine, throttle engine, record stream management, and all core transaction and query workflows.
+  </Card>
+  <Card title="hedera-app-spi" icon="plug">
+    The Service Provider Interface shared by all service modules. Defines what `hedera-app` provides to services (`HandleContext`, `ReadableStoreFactory`, `WritableStoreFactory`, `FeeContext`, `RecordBuilder`) and what services provide to `hedera-app` (`TransactionHandler`, `QueryHandler`, `PreTransactionHandler`, `Service`).
+  </Card>
+  <Card title="Service API modules" icon="file-code">
+    One per service (e.g. `hedera-token-service`). Defines POJO entities (e.g. `Account`, `Token`), handler interfaces, and state schema declarations. Contains no implementation code.
+  </Card>
+  <Card title="Service implementation modules" icon="gear">
+    One per service (e.g. `hedera-token-service-impl`). Contains `TransactionHandler`, `QueryHandler`, and `PreTransactionHandler` implementations, plus state persistence logic. Depends only on its own API module and `hedera-app-spi`.
+  </Card>
+</CardGroup>
+
+The full list of service module pairs:
+
+| API module | Implementation module | Service |
+|---|---|---|
+| `hedera-token-service` | `hedera-token-service-impl` | Fungible tokens, NFTs, crypto accounts (HTS) |
+| `hedera-consensus-service` | `hedera-consensus-service-impl` | Topic creation and message ordering (HCS) |
+| `hedera-smart-contract-service` | `hedera-smart-contract-service-impl` | EVM-compatible Solidity contract execution |
+| `hedera-file-service` | `hedera-file-service-impl` | Decentralized file create, update, delete |
+| `hedera-network-admin-service` | `hedera-network-admin-service-impl` | Network-level account queries and administration |
+| `hedera-schedule-service` | `hedera-schedule-service-impl` | Deferred and conditionally triggered transactions |
+| `hedera-util-service` | `hedera-util-service-impl` | Shared utility functions across services |
+| `hedera-addressbook-service` | `hedera-addressbook-service-impl` | Node address book management |
+
+## The SPI pattern
+
+`hedera-app-spi` is the interface contract that makes service isolation possible. It defines two sets of interfaces:
+
+1. **Interfaces implemented by `hedera-app`** — injected into service modules at runtime via `HandleContext` and similar types: `ReadableStoreFactory`, `WritableStoreFactory`, `FeeContext`, `RecordBuilder` variants, `StoreFactory`, `ExchangeRateInfo`, and others.
+
+2. **Interfaces implemented by service modules** — called by `hedera-app` to dispatch work: `Service`, `TransactionHandler`, `PreTransactionHandler`, and `QueryHandler`.
+
+Because service modules import only `hedera-app-spi` — and never `hedera-app` — they are completely decoupled from application internals. Each service module can be:
+
+- **Built independently** — no dependency on the full node build
+- **Tested in isolation** — SPI interfaces are straightforward to mock or stub
+- **Replaced** — a new implementation module can swap in without modifying `hedera-app`
+
+```java
+// A service implementation only needs hedera-app-spi on its classpath.
+// hedera-app provides the HandleContext at runtime.
+public class CryptoTransferHandler implements TransactionHandler {
+
+    @Override
+    public void handle(HandleContext context) throws HandleException {
+        var storeFactory = context.storeFactory();
+        var accountStore = storeFactory.writableStore(WritableAccountStore.class);
+        // ... transfer logic, entirely within the service module
+    }
+}
+```
+
+<Tip>
+  By design, every service module can be fully tested — including all transaction paths, error conditions, and record generation — without running a complete consensus node or even loading `hedera-app`.
+</Tip>
+
+The `Service` interface acts as a factory for all handler types and registers the service's state schema into the merkle tree:
+
+```java
+public interface Service {
+    String getServiceName();
+    void registerSchemas(SchemaRegistry registry);
+}
+```
+
+Each `Service` implementation receives a `StateRegistry` in its constructor to declare which keys and values it stores in its portion of the merkle tree.
+
+## Transaction lifecycle
+
+The journey of a transaction from client submission to committed state change passes through four distinct phases, each handled by a workflow class inside `hedera-app`.
+
+<Steps>
+  <Step title="Client → gRPC ingest">
+    A client submits a serialised `Transaction` protobuf to the node's gRPC endpoint (port 50211 by default). The gRPC layer in `hedera-app` deserialises the request and hands it to the **`IngestWorkflow`**, which runs these checks in order:
+
+    1. **Node availability** — rejects if the node is frozen, reconnecting, or in a non-operational state
+    2. **Parse and syntax validation** — deserialises the byte buffer; rejects unknown protobuf fields or oversize transactions
+    3. **Submitted-node check** — the `nodeAccountID` in the transaction header must match this node
+    4. **Time-box validation** — the transaction's valid start time and duration must fall within configured bounds
+    5. **Deduplication** — rejects transaction IDs already seen
+    6. **Throttle check** — per-service and global rate limits are enforced as early as possible
+    7. **Pure checks** — stateless, handler-specific validation (e.g. required fields present)
+    8. **Payer signature verification** — only the payer's signature is checked at ingest; other signatories are deferred to pre-handle
+    9. **Fee estimation and solvency** — estimates the fee and confirms the payer account can cover it
+    10. **Platform submission** — forwards the transaction bytes to the platform's gossip layer
+
+    On success the node returns a `TransactionResponse` with precheck code `OK`. On any failure, the transaction is rejected with an error code and never enters the platform.
+  </Step>
+  <Step title="Pre-consensus (pre-handle)">
+    After the transaction is gossiped into a platform event, but before consensus order is assigned, the **`PreHandleWorkflow`** processes it asynchronously on a background thread pool. For each transaction inside an event:
+
+    1. Parse the transaction and extract the common header
+    2. Invoke the service's `PreTransactionHandler` — validates service-specific fields and pre-loads state data into a metadata cache
+    3. Run pure checks that are independent of state and configuration
+    4. Prepare signature data for all required keys (payer and additional signatories): the signed bytes, the expected public key, and the `SignaturePair` from the `SignatureMap`
+    5. Submit the prepared signature data to the platform for batch cryptographic verification
+    6. Attach the resulting `TransactionMetadata` to the platform transaction object
+
+    This phase overlaps with gossip and consensus, hiding cryptographic verification latency from the critical execution path.
+  </Step>
+  <Step title="Handle-transaction workflow">
+    Once the platform delivers a consensus-ordered transaction, the **`HandleWorkflow`** executes it:
+
+    1. `BlockRecordManager` updates the consensus timestamp for this transaction and updates block info in state if a new block has started
+    2. System hooks run: staking period processing and rewards distribution, expired schedule cleanup, consensus clock advancement
+    3. A `Dispatch` object is created for the user transaction (encapsulating writable state, a `RecordBuilder`, and fee context)
+    4. Hollow accounts are finalised if required
+    5. `DispatchProcessor.processDispatch()` is called — a shared processor used for both user and child transactions:
+       - Re-validates the pre-handle result; if a node due-diligence failure is detected, charges the node and returns
+       - Verifies the payer signature is present and valid
+       - Detects duplicate transactions; charges the node (same-node duplicate) or the payer (cross-node duplicate)
+       - Charges the payer the transaction fee
+       - Calls the service `TransactionHandler.handle()` with a `HandleContext`
+       - On success, marks the record `SUCCESS` and notifies system-file update listeners
+       - On `HandleException`, rolls back the entire state stack and re-charges the payer (previous charge was rolled back)
+       - On `ThrottleException`, rolls back and charges the payer without a service fee
+       - On unhandled exceptions, rolls back and marks the record `FAIL_INVALID`
+    6. Commits all state changes atomically to the merkle tree
+    7. Finalises the transaction record from the committed state changes
+    8. Tracks network utilisation metrics
+    9. Adds records to the record cache
+
+    Child transactions (e.g. hollow account creation triggered by a `CryptoTransfer`) are handled by creating a `ChildDispatch` and calling the same `DispatchProcessor`, so no logic is duplicated.
+  </Step>
+  <Step title="Record stream">
+    After handle completes, the `HandleWorkflow` externalises record stream items for every transaction (user and child). The `RecordStreamManager` inside `hedera-app` batches these into **record files** and uploads them — alongside the raw **event files** produced by the hashgraph — to S3-compatible storage. Mirror nodes download these files to index the full transaction history and serve it through their own APIs.
+
+    <Note>
+      The record stream is being superseded by the **Block Stream** — a fully verifiable stream of blocks corresponding to consensus rounds. Each block contains all events, transactions, and state changes for that round, connected to the previous block by a block hash, and sealed with an aggregated BLS signature.
+    </Note>
+  </Step>
+</Steps>
+
+## Query lifecycle
+
+Queries follow a synchronous path through the **`QueryWorkflow`** and never pass through consensus:
+
+1. Parse the query header and determine the query type
+2. Check node availability and per-query throttle limits
+3. If payment is required: run ingest checks on the embedded `CryptoTransfer`, validate it, check permissions, and calculate the fee
+4. Validate the query semantically against the current immutable state
+5. Submit the embedded payment `CryptoTransfer` to the platform (if required)
+6. Execute the query against the latest immutable state snapshot and return the response
+
+## State model
+
+All network state is held in the **merkle tree** managed by the Platform SDK's `VirtualMap`. The `hedera-app` module organises state into named namespaces, one per service:
+
+```
+MerkleRoot
+├── accounts          (hedera-token-service-impl)
+├── tokens            (hedera-token-service-impl)
+├── topics            (hedera-consensus-service-impl)
+├── files             (hedera-file-service-impl)
+├── contracts         (hedera-smart-contract-service-impl)
+├── schedules         (hedera-schedule-service-impl)
+├── nodes             (hedera-addressbook-service-impl)
+└── ...
+```
+
+Each service declares its state schema via `StateRegistry` in its `Service` constructor. The `hedera-app` module assembles the full tree at startup by calling `registerSchemas` on each `Service` implementation.
+
+## Module layout on disk
+
+Each service module pair follows a consistent directory structure:
+
+```
+hedera-token-service/          # API module
+├── src/main/java/
+│   └── com/hedera/node/app/service/token/
+│       └── TokenService.java
+└── build.gradle.kts
+
+hedera-token-service-impl/     # Implementation module
+├── src/main/java/
+│   └── com/hedera/node/app/service/token/impl/
+│       └── TokenServiceImpl.java
+├── src/test/           # Unit tests
+├── src/testFixtures/   # Shared test helpers
+└── build.gradle.kts
+```
+
+All modules are Java Platform Module System (JPMS) modules. Module names follow the pattern `com.hedera.node.app.service.<name>`, which also defines the root package for all classes in that module.
+
+## Explore further
+
+<CardGroup cols={2}>
+  <Card title="Core services" icon="layer-group" href="/services/overview">
+    Explore HCS, HTS, smart contracts, file storage, scheduling, and the address book service.
+  </Card>
+  <Card title="Platform SDK" icon="microchip" href="/platform/overview">
+    Learn about gossip protocols, the hashgraph algorithm, event flow, and merkle state management.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build and run a local node and submit your first transaction.
+  </Card>
+  <Card title="Operations" icon="server" href="/operations/deployment">
+    Configure and operate a production consensus node.
+  </Card>
+</CardGroup>

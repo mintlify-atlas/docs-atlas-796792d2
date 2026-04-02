@@ -1,0 +1,78 @@
+---
+title: "Platform SDK Overview"
+description: "The foundational layer of Hiero Consensus Node — gossip, consensus, Merkle state, and shared utilities that every service builds on."
+keywords: ["platform sdk", "hashgraph", "gossip", "merkle", "base", "core", "data"]
+---
+
+The Platform SDK is the distributed-systems engine underneath every service in the Hiero Consensus Node. It handles peer-to-peer communication, the hashgraph consensus algorithm, ledger state management, and all the shared infrastructure (logging, configuration, metrics) that the application layer depends on.
+
+The SDK is organised into three layers:
+
+<CardGroup cols={3}>
+  <Card title="Base" icon="wrench" href="/platform/configuration">
+    Common utilities: logging, layered configuration, metrics, thread management, and null-safety annotations.
+  </Card>
+  <Card title="Core" icon="circle-nodes" href="/platform/gossip-consensus">
+    Gossip protocols, the hashgraph algorithm, event intake pipeline, consensus output, and the platform lifecycle state machine.
+  </Card>
+  <Card title="Data" icon="database" href="/platform/state-management">
+    Merkle tree APIs for holding ledger state, VirtualMap for large key-value datasets backed by MerkleDB, fast-copy semantics, and state signing.
+  </Card>
+</CardGroup>
+
+## Relationship to the application layer
+
+The Hedera services (token service, consensus service, smart contracts, etc.) run on top of the Platform SDK through a set of well-defined service-provider interfaces (SPIs). The application layer is responsible for:
+
+- **Transaction handling** — receiving ordered, post-consensus transactions from the platform and applying them to application state.
+- **State reads and writes** — reading and mutating the shared `MerkleMap` / `VirtualMap` structures that the platform persists and signs.
+- **Lifecycle notifications** — reacting to platform status changes (for example, entering freeze mode before a software upgrade).
+
+The platform is deliberately agnostic about the semantics of transactions; it concerns itself only with ordering them fairly and maintaining a cryptographically verifiable state.
+
+## Layer breakdown
+
+### Base
+
+The `Base` layer (`swirlds-base`, `swirlds-config-api`, `swirlds-logging`, `swirlds-metrics-api`, and related modules) provides infrastructure that every other module depends on. Key highlights:
+
+- **Layered configuration** — a `ConfigurationBuilder` that merges property files, environment variables, and classpath defaults, exposed through strongly-typed Java record contracts (see [Platform Configuration](/platform/configuration)).
+- **Metrics** — a `Metrics` interface with global and per-platform scopes, a `SnapshotService` for periodic sampling, and a built-in Prometheus exporter.
+- **Logging** — a structured logging layer with a Log4j appender for production deployments.
+- **Null-safety annotations** — `@NonNull` / `@Nullable` throughout the public API surface to eliminate ambiguity.
+
+<Note>
+  All Base modules declare minimal external dependencies so they can be reused outside the platform. Each module is a named Java module compatible with both the module path and the classpath.
+</Note>
+
+### Core
+
+The `Core` layer implements the distributed consensus engine. It is composed of wired-together components, each with its own task scheduler and business logic, connected by typed input/output wires (the Component Framework). Key subsystems:
+
+- **Gossip** — nodes exchange signed events with peers using a sync protocol. Each sync session compares tip hashes and transmits only the events the other side is missing.
+- **Hashgraph** — a directed acyclic graph of events. The hashgraph algorithm deterministically assigns a consensus timestamp and a total order to every transaction without any elected leader.
+- **Event intake pipeline** — inbound events are validated, deduplicated, and fed into the hashgraph.
+- **Platform status manager** — a state machine that drives the node through `STARTING_UP → REPLAYING_EVENTS → OBSERVING → CHECKING → ACTIVE` (and freeze / reconnect branches).
+
+### Data
+
+The `Data` layer provides the Merkle tree that holds all ledger state:
+
+- **Merkle APIs** — fast-copy (copy-on-write) semantics let the platform snapshot state without blocking the event pipeline. Reference counting controls memory lifetime.
+- **VirtualMap** — a virtual Merkle leaf suitable for very large datasets (hundreds of millions of key-value pairs), backed by MerkleDB on disk.
+- **State signing and ISS detection** — after each round, nodes exchange signatures on the state root hash. Inconsistent state signatures (ISS) trigger an alert and halt the node.
+- **Reconnect** — a lagging node can download a recent state snapshot from a peer and resume from there instead of replaying the full event history.
+
+## Further reading
+
+<CardGroup cols={3}>
+  <Card title="Gossip and consensus" icon="circle-nodes" href="/platform/gossip-consensus">
+    How nodes exchange events and reach total ordering via the hashgraph algorithm.
+  </Card>
+  <Card title="State management" icon="database" href="/platform/state-management">
+    Merkle trees, VirtualMap, fast copy, state signing, and reconnect.
+  </Card>
+  <Card title="Platform configuration" icon="sliders" href="/platform/configuration">
+    The layered config system: records, sources, converters, and validation.
+  </Card>
+</CardGroup>

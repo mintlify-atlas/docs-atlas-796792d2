@@ -1,0 +1,128 @@
+---
+title: "Gossip and Consensus"
+description: "How Hiero Consensus Node nodes exchange events over gossip and reach a fair, deterministic total ordering via the hashgraph algorithm."
+keywords: ["gossip", "hashgraph", "consensus", "events", "platform status", "sync protocol", "freeze"]
+---
+
+Every node in the network participates in two interleaved activities: **gossiping** new events to peers, and running the **hashgraph algorithm** locally to assign a deterministic consensus timestamp and total order to every transaction. No leader is elected and no single node can bias the outcome.
+
+## Event flow
+
+<Steps>
+  <Step title="Event creation">
+    A node bundles pending transactions into a new **event**. Each event records the hash of the creator's previous self-event and the hash of the last event received from a randomly selected peer (the "other-parent"). This two-parent linkage is what builds the hashgraph DAG.
+  </Step>
+  <Step title="Gossip">
+    The node opens a sync session with a randomly chosen peer. The two sides exchange tip hashes (events with no self-child) and then transmit only the events the other side is missing — sorted in topological order so parents always arrive before children.
+  </Step>
+  <Step title="Event intake">
+    Inbound events are validated (signature check, parent existence check, deduplication) and inserted into the local hashgraph. The intake pipeline is built with the Component Framework: each stage is a typed wire connecting a task scheduler to a unit of business logic, so throughput and threading can be tuned independently.
+  </Step>
+  <Step title="Hashgraph consensus">
+    The hashgraph algorithm runs locally and deterministically on every node. It identifies **witnesses** (first events created by each node in a round), runs a virtual voting procedure to elect **famous witnesses**, and uses their positions in the DAG to assign a consensus timestamp (the median of the times at which famous witnesses first saw the event) and a round number to each event.
+  </Step>
+  <Step title="Consensus output">
+    Once a round is complete, the ordered list of transactions is handed to the application layer's `handleTransaction` entry point. The application mutates its `SwirldState` identically on every node.
+  </Step>
+</Steps>
+
+## Sync gossip protocol
+
+The sync protocol exchanges events in three phases. Each phase runs in parallel: while one side is sending, the other side is receiving.
+
+```text
+// Phase 1 — exchange generation metadata and tip hashes
+send   maxRoundGen, minGenNonAncient, minGenNonExpired, tipList
+recv   otherMaxRoundGen, otherMinGenNonAncient, otherMinGenNonExpired, otherTipHashList
+
+// Abort if either side is too far behind the other
+if otherMaxRoundGen < minGenNonExpired  → abort (they are too old)
+if maxRoundGen < otherMinGenNonExpired  → record a "behind" vote, abort
+
+// Phase 2 — confirm which tips are mutually known
+send   for each tip in otherTipHashList: boolean (do I have this event?)
+recv   for each tip in my tipList: boolean (does the peer have this event?)
+
+// Phase 3 — compute send list and exchange events
+// Walk ancestors; add to sendList any event not already known to peer
+sort sendList ascending by generation   // topological order
+send sendList
+recv otherSendList → queue for intake
+```
+
+<Note>
+  The protocol works on an immutable snapshot of the local graph so that events cannot expire or shift generation numbers mid-sync. This guarantees consistent `maxRoundGen`, `minGenNonAncient`, and `minGenNonExpired` values throughout a session.
+</Note>
+
+### Duplicate-event filtering
+
+Concurrent sync sessions frequently attempt to send the same event. To reduce redundant bandwidth:
+
+- **Self-events** are transmitted by their creator and delayed when received from others.
+- **Ancestor events** (those that are ancestors of a self-event but created by other nodes) are sent aggressively because they are prerequisites for validating the self-event.
+- **Other events** (not ancestors of any recent self-event) are delayed for several seconds, giving the original creator time to sync them first.
+
+When the optional broadcast transport is enabled, self-events propagate over broadcast rather than sync, allowing even longer sync delays for self-events while keeping ancestor propagation fast.
+
+## Platform status lifecycle
+
+The platform progresses through a well-defined sequence of statuses managed by `PlatformStatusManager`. The application layer receives notifications on each transition.
+
+<AccordionGroup>
+  <Accordion title="STARTING_UP">
+    The initial status. The node has not yet loaded any state or begun replaying events. Under normal operation this transitions immediately to `REPLAYING_EVENTS`.
+  </Accordion>
+  <Accordion title="REPLAYING_EVENTS">
+    Before gossiping, the node replays events from the pre-consensus event stream on disk. This restores in-memory hashgraph state after a restart. Even when no events need to be replayed, the node passes through this status for consistency. Transitions to `OBSERVING` once replay is complete, or directly to `FREEZE_COMPLETE` if a freeze timestamp was crossed during replay.
+  </Accordion>
+  <Accordion title="OBSERVING">
+    Gossip is active but the node does not yet create events. The purpose is to rediscover any self-events that were gossiped before the previous shutdown but not written to disk — creating a new event before finding those old ones would cause a branch in the DAG.
+  </Accordion>
+  <Accordion title="CHECKING">
+    The node begins creating events but does not yet accept application transactions. It remains here until one of its own events reaches consensus, confirming that the node is properly connected to the network.
+  </Accordion>
+  <Accordion title="ACTIVE">
+    Normal operation. The node creates events and accepts application transactions. If peers report that the node is lagging, or if a quiesce instruction is issued, event creation may pause temporarily.
+  </Accordion>
+  <Accordion title="BEHIND">
+    The node has fallen behind the rest of the network. Gossip stops and a **reconnect** begins: the node downloads a recent signed state from a peer and resumes from there. Possible from `OBSERVING`, `CHECKING`, `ACTIVE`, or `RECONNECT_COMPLETE`.
+  </Accordion>
+  <Accordion title="RECONNECT_COMPLETE">
+    Reconnect succeeded. The node resumes gossip but does not create events until the received state has been flushed to disk, ensuring a valid replay starting point exists. If the node determines it is still behind, it transitions back to `BEHIND`.
+  </Accordion>
+  <Accordion title="FREEZING">
+    A freeze transaction set a freeze timestamp and consensus time has now crossed it. The node continues to gossip and may create events, but will produce no more events after creating one that includes its signature over the freeze state. Transitions to `FREEZE_COMPLETE` once the freeze state is written to disk.
+  </Accordion>
+  <Accordion title="FREEZE_COMPLETE">
+    The freeze state is on disk. The node continues gossiping to distribute freeze-state signatures to peers that don't yet have them. This status is terminal — the node will be shut down externally to apply the software upgrade.
+  </Accordion>
+  <Accordion title="CATASTROPHIC_FAILURE">
+    An unrecoverable error occurred. The node cannot resume and must be restarted.
+  </Accordion>
+</AccordionGroup>
+
+## Freeze process
+
+A freeze is a coordinated, ordered shutdown used before software upgrades. It guarantees that every node writes the exact same final state to disk.
+
+<Steps>
+  <Step title="Schedule the freeze">
+    The application submits a freeze transaction specifying a future freeze timestamp. The platform gossips it out and every node reaches consensus on it.
+  </Step>
+  <Step title="Consensus time advances to the freeze timestamp">
+    The platform transitions to `FREEZING`. No new user transactions are accepted (the platform status becomes `MAINTENANCE`).
+  </Step>
+  <Step title="Freeze state is created">
+    When the freeze round finishes processing, the node computes the freeze state, hashes it, signs it, and places a signature transaction in the gossip pool so peers can collect the signature.
+  </Step>
+  <Step title="State written to disk">
+    Once enough peer signatures are collected, the node writes the freeze state to disk and transitions to `FREEZE_COMPLETE`. Nodes continue gossiping to share signatures.
+  </Step>
+  <Step title="External restart">
+    An operator restarts all nodes after all have reached `FREEZE_COMPLETE`. Nodes boot with the new software version and resume from the freeze state.
+  </Step>
+</Steps>
+
+<Warning>
+  Consensus time must reach the freeze timestamp before the freeze can complete. If there is no traffic, the platform automatically disables transaction throttling one minute before the freeze time to ensure enough events are created to advance consensus time past it.
+</Warning>

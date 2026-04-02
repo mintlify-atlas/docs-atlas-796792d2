@@ -1,0 +1,211 @@
+---
+title: "Throttling"
+description: "How leaky-bucket throttles protect the network from overload — bucket design, per-operation TPS limits, gas throttles, and runtime enforcement."
+---
+
+The Hiero consensus node uses a **leaky-bucket throttle** system to limit how many transactions each node will accept per second and to protect the network from resource exhaustion. The same throttle infrastructure also drives automated congestion pricing.
+
+## The leaky-bucket model
+
+Imagine a bucket that holds exactly one litre of water but drains at a constant rate of one litre per second. Each time a transaction arrives, a fixed amount of water is added. When the bucket is full, the node rejects further transactions of the types assigned to that bucket until enough water drains away.
+
+- A transaction that arrives when the bucket has room is **accepted**.
+- A transaction that arrives when the bucket is full is **rejected** — the client receives `BUSY` (at the frontend) or `THROTTLED_AT_CONSENSUS` (at the backend).
+- If the bucket is empty for a full burst period, the full capacity is available for a burst of transactions.
+
+The amount of water added per transaction depends on the configured operations-per-second (OPS) limit for that transaction type: one transaction adds `1 / opsPerSec` of the bucket's capacity.
+
+### Example
+
+A bucket configured for `ContractCreate` at **13 OPS** means:
+- Each `ContractCreate` adds `1/13` of a litre.
+- 13 `ContractCreate` transactions arriving simultaneously fill the bucket instantly.
+- It then takes 1/13 of a second for one transaction's worth of capacity to drain back.
+- If no transactions arrive for a full second, the bucket empties and can absorb another burst of 13.
+
+## Multiple buckets
+
+A node can run multiple buckets simultaneously. When a transaction maps to more than one bucket, it must satisfy **all** assigned buckets — rejection by any single bucket rejects the transaction. This lets operators enforce multiple orthogonal constraints at once.
+
+For example, assigning `CryptoTransfer` only to a high-throughput bucket while assigning `ContractCall` to both that bucket and a lower-capacity "priority" bucket ensures that contract calls can never monopolise capacity and starve out crypto transfers.
+
+## The four standard buckets
+
+The throttle definitions in system file `0.0.123` configure four buckets by default.
+
+### ThroughputLimits
+
+The primary throughput bucket. Most operations share this bucket.
+
+```json
+{
+  "name": "ThroughputLimits",
+  "burstPeriod": 1,
+  "throttleGroups": [
+    {
+      "opsPerSec": 10000,
+      "operations": [
+        "CryptoCreate", "CryptoTransfer", "CryptoUpdate", "CryptoDelete",
+        "CryptoGetInfo", "CryptoGetAccountRecords",
+        "ConsensusCreateTopic", "ConsensusSubmitMessage", "ConsensusUpdateTopic",
+        "ConsensusDeleteTopic", "ConsensusGetTopicInfo",
+        "TokenGetInfo", "ScheduleDelete", "ScheduleGetInfo",
+        "FileGetContents", "FileGetInfo",
+        "ContractUpdate", "ContractDelete", "ContractGetInfo",
+        "ContractGetBytecode", "ContractGetRecords", "ContractCallLocal",
+        "TransactionGetRecord", "GetVersionInfo", "UtilPrng"
+      ]
+    },
+    {
+      "opsPerSec": 13,
+      "operations": [
+        "ContractCall", "ContractCreate", "FileCreate",
+        "FileUpdate", "FileAppend", "FileDelete"
+      ]
+    },
+    {
+      "opsPerSec": 3000,
+      "operations": [
+        "ScheduleSign",
+        "TokenCreate", "TokenDelete", "TokenMint", "TokenBurn",
+        "TokenUpdate", "TokenAssociateToAccount", "TokenAccountWipe",
+        "TokenDissociateFromAccount", "TokenFreezeAccount", "TokenUnfreezeAccount",
+        "TokenGrantKycToAccount", "TokenRevokeKycFromAccount"
+      ]
+    }
+  ]
+}
+```
+
+Key limits to note:
+
+| Operation group | OPS limit |
+|----------------|-----------|
+| `CryptoTransfer`, most reads | 10,000 |
+| Token lifecycle operations | 3,000 |
+| `ContractCall`, `ContractCreate`, file mutations | 13 |
+
+### PriorityReservations
+
+A second bucket that caps smart-contract and file-mutation throughput to ensure other transaction types always have remaining capacity in `ThroughputLimits`.
+
+```json
+{
+  "name": "PriorityReservations",
+  "burstPeriod": 1,
+  "throttleGroups": [
+    {
+      "opsPerSec": 10,
+      "operations": [
+        "ContractCall", "ContractCreate", "FileCreate",
+        "FileUpdate", "FileAppend", "FileDelete"
+      ]
+    }
+  ]
+}
+```
+
+Because `ContractCall` maps to both `ThroughputLimits` (at 13 OPS) and `PriorityReservations` (at 10 OPS), the effective cap for contract calls is **10 OPS** — `PriorityReservations` is the binding constraint. This guarantees that at full contract-call load, `ThroughputLimits` still retains `3/13 × 10,000 ≈ 2,300` OPS worth of capacity for other transaction types.
+
+### CreationLimits
+
+A separate bucket controlling how fast new persistent entities can be created. The goal is not to limit execution speed but to bound long-term memory growth from entity creation.
+
+```json
+{
+  "name": "CreationLimits",
+  "burstPeriod": 10,
+  "throttleGroups": [
+    {
+      "opsPerSec": 2,
+      "operations": ["CryptoCreate"]
+    },
+    {
+      "opsPerSec": 5,
+      "operations": ["ConsensusCreateTopic"]
+    },
+    {
+      "opsPerSec": 100,
+      "operations": ["TokenCreate", "TokenAssociateToAccount", "ScheduleCreate"]
+    }
+  ]
+}
+```
+
+Notice the `burstPeriod` of `10` seconds: this bucket allows a burst of up to 10× the per-second rate before throttling kicks in. `CryptoCreate` at 2 OPS with a 10-second burst period means up to 20 account creations can arrive at once before the bucket fills.
+
+### FreeQueryLimits
+
+A ceiling on free, unauthenticated query throughput.
+
+```json
+{
+  "name": "FreeQueryLimits",
+  "burstPeriod": 1,
+  "throttleGroups": [
+    {
+      "opsPerSec": 1000000,
+      "operations": ["CryptoGetAccountBalance", "TransactionGetReceipt"]
+    }
+  ]
+}
+```
+
+## Gas-based throttling for contract operations
+
+In addition to TPS buckets, the node enforces **gas-per-second** limits on `ContractCall`, `ContractCallLocal`, and `ContractCreate`. There are two distinct gas throttles, one for each enforcement phase.
+
+| Throttle | Config property | Enforcement point | Status on denial |
+|----------|----------------|-------------------|-----------------|
+| Frontend gas | `contracts.maxGasPerSec` | gRPC ingest (per-node) | `BUSY` |
+| Backend gas | `contracts.maxGasPerSecBackend` | Consensus handle | `CONSENSUS_GAS_EXHAUSTED` |
+
+Gas throttling is enabled by setting `contracts.throttle.throttleByGas=true` (the default). When a contract transaction's gas limit would exceed the remaining gas budget for the current second, the node rejects it.
+
+An additional **ops-duration throttle** is available for contract execution:
+
+| Config property | Purpose |
+|----------------|---------|
+| `contracts.opsDurationThrottleCapacity` | Total ops-duration units available per cycle |
+| `contracts.opsDurationThrottleUnitsFreedPerSecond` | Drain rate |
+| `contracts.throttle.throttleByOpsDuration` | Enable/disable |
+
+When ops-duration capacity is exhausted before EVM execution begins, the transaction fails with `CONSENSUS_GAS_EXHAUSTED`.
+
+## Frontend vs. backend throttling
+
+The throttle system operates at two independent points in the transaction lifecycle.
+
+<Tabs>
+  <Tab title="Frontend (ingest)">
+    Applied during gRPC ingest before the transaction enters the gossip network. Each node enforces a **per-node** capacity derived from the network-wide throttle divided by the number of nodes. For a 100-node network with a 10,000 TPS network limit, each node's frontend throttle is set to 100 TPS.
+
+    - Thread-safe via `SynchronizedThrottleAccumulator`.
+    - Rejection status: `BUSY`.
+    - Does not affect consensus or state.
+  </Tab>
+  <Tab title="Backend (consensus)">
+    Applied during the handle/consensus phase, after the transaction has achieved consensus ordering. These throttles use **consensus time** (not wall-clock time) and are therefore deterministic across all nodes.
+
+    - Drives congestion pricing calculations.
+    - State is persisted in `CongestionThrottleService` so it survives restarts.
+    - Rejection status: `THROTTLED_AT_CONSENSUS` (TPS buckets) or `CONSENSUS_GAS_EXHAUSTED` (gas throttle).
+  </Tab>
+</Tabs>
+
+## Updating throttle definitions
+
+Throttle definitions live in system file `0.0.123`. To replace them, submit a `FileUpdate` transaction to that file with a JSON payload matching the throttle bucket schema shown above. Only authorised accounts (`0.0.2`, `0.0.50`, `0.0.55`, `0.0.57`) can update system file `0.0.123`.
+
+For development environments you can use a looser throttle file by setting the bootstrap property:
+
+```properties
+# data/config/bootstrap.properties
+bootstrap.throttleDefsJson.resource=throttles-dev.json
+```
+
+This replaces the genesis contents of file `0.0.123` with the bundled `throttles-dev.json`, which allows significantly higher TPS. This setting has no effect after genesis.
+
+## Throttle state and recovery
+
+Throttle usage snapshots and congestion level start times are saved as part of consensus state (`THROTTLE_USAGE_SNAPSHOTS`, `CONGESTION_LEVEL_STARTS`). On startup or reconnect, `ThrottleServiceManager` rehydrates the throttle buckets from these snapshots so that the congestion multiplier resumes correctly without a cold-start spike.

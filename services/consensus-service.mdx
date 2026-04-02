@@ -1,0 +1,155 @@
+---
+title: "Hedera Consensus Service (HCS)"
+description: "Decentralized, tamper-proof message ordering with consensus timestamps for audit logs, supply chains, and distributed applications."
+keywords: ["HCS", "consensus service", "topics", "message submission", "consensus timestamp", "audit log"]
+---
+
+The Hedera Consensus Service (HCS) provides a decentralized, verifiable ordering of opaque binary messages. It implements asynchronous Byzantine fault-tolerant (aBFT) consensus so that any party with access to the Hedera network can agree on the exact order and precise timestamp of events — without trusting any single participant.
+
+## How HCS works
+
+<Steps>
+  <Step title="Create a topic">
+    A client submits a `ConsensusCreateTopic` transaction to the network. The resulting `TopicID` (e.g. `0.0.12345`) is the durable address for the message stream.
+  </Step>
+  <Step title="Submit messages">
+    Any application submits messages to the topic using `ConsensusSubmitMessage`. If the topic has a `submitKey`, the transaction must be signed by that key.
+  </Step>
+  <Step title="Consensus ordering">
+    Hedera nodes apply the hashgraph algorithm to agree on the order and timestamp of every message. Each message receives an immutable **consensus timestamp** and a monotonically increasing **sequence number**.
+  </Step>
+  <Step title="Stream or query results">
+    Applications read the ordered log via a mirror node event stream or by submitting a `ConsensusGetTopicInfo` query to read topic metadata.
+  </Step>
+</Steps>
+
+## Key properties
+
+| Property | Detail |
+|---|---|
+| **Finality** | Transactions reach finality in seconds |
+| **Immutability** | Once consensus is reached, messages cannot be altered |
+| **Throughput** | Designed for high-volume message workloads |
+| **Native fees** | Optional custom fee per message submission (see below) |
+| **Access control** | Optional `adminKey` and `submitKey` for topic governance |
+
+## Transaction types
+
+### ConsensusCreateTopic
+
+Creates a new topic on the network. Key fields:
+
+```protobuf
+message ConsensusCreateTopicTransactionBody {
+  string memo = 1;          // Human-readable label, max 100 bytes UTF-8
+  Key adminKey = 3;         // Controls update and delete operations
+  Key submitKey = 4;        // Required signer for message submissions
+  Duration autoRenewPeriod = 6;    // Initial lifetime and renewal period
+  AccountID autoRenewAccount = 7;  // Optional account funding renewals
+  Key feeScheduleKey = 8;          // Controls custom fee updates
+  repeated Key feeExemptKeyList = 9;
+  repeated CustomFee customFees = 10;
+}
+```
+
+<Note>
+If no `adminKey` is set, the topic becomes immutable — only its expiration time can be extended, and it cannot be deleted.
+</Note>
+
+### ConsensusSubmitMessage
+
+Submits a message to an existing topic. The receipt includes the topic's updated sequence number and running hash:
+
+```protobuf
+message ConsensusSubmitMessageTransactionBody {
+  TopicID topicID = 1;         // Target topic
+  bytes message = 2;           // Payload, max 6 KiB per transaction
+  ConsensusMessageChunkInfo chunkInfo = 3; // Optional: chunked message metadata
+}
+```
+
+Large messages can be split into chunks using `chunkInfo`. Each chunk is an independent transaction, and the mirror node reassembles them in order.
+
+### ConsensusUpdateTopic
+
+Updates mutable topic properties. Only the fields you set are changed:
+
+```protobuf
+message ConsensusUpdateTopicTransactionBody {
+  TopicID topicID = 1;
+  string memo = 2;
+  Timestamp expirationTime = 4;
+  Key adminKey = 6;
+  Key submitKey = 7;
+  Duration autoRenewPeriod = 8;
+  AccountID autoRenewAccount = 9;
+  Key feeScheduleKey = 10;
+  repeated Key feeExemptKeyList = 11;
+  repeated CustomFee customFees = 12;
+}
+```
+
+<Warning>
+If a `feeScheduleKey` was not set when the topic was created, it cannot be added later (`FEE_SCHEDULE_KEY_CANNOT_BE_UPDATED`).
+</Warning>
+
+### ConsensusDeleteTopic
+
+Marks a topic as deleted. Requires the `adminKey` signature. After deletion the topic's contents become empty and it will not renew:
+
+```protobuf
+message ConsensusDeleteTopicTransactionBody {
+  TopicID topicID = 1;
+}
+```
+
+## Query types
+
+### ConsensusGetTopicInfo
+
+Returns current metadata for a topic, including `memo`, running hash, sequence number, expiration time, and configured keys:
+
+```protobuf
+message ConsensusGetTopicInfoQuery {
+  QueryHeader header = 1;
+  TopicID topicID = 2;
+}
+```
+
+## Custom fees
+
+Topics support an optional native fee system. When `customFees` are set on a topic, every `ConsensusSubmitMessage` transaction automatically assesses those fees against the submitting account at consensus time. Key constraints:
+
+- Fees are defined and updated via the `feeScheduleKey`.
+- Accounts in `feeExemptKeyList` are not charged.
+- The maximum fee a submitter is willing to pay is expressed in the transaction; if the assessed fee exceeds that limit, the transaction fails with `MAX_CUSTOM_FEE_LIMIT_EXCEEDED`.
+
+## Service module layout
+
+| Module | Role |
+|---|---|
+| `hedera-consensus-service` | `ConsensusService` interface, `ReadableTopicStore`, `ConsensusServiceDefinition` |
+| `hedera-consensus-service-impl` | Handlers, writable stores, schema migrations |
+
+The service interface is loaded via the Java SPI:
+
+```java
+ConsensusService cs = ConsensusService.getInstance();
+```
+
+## Use cases
+
+<AccordionGroup>
+  <Accordion title="Audit logs">
+    Record compliance events in an immutable, time-ordered log. Any party can independently verify the sequence and timestamps without relying on a central database.
+  </Accordion>
+  <Accordion title="Supply chain tracking">
+    Each custody transfer or status change is submitted as a message. The consensus timestamp provides a trusted record of when each event occurred.
+  </Accordion>
+  <Accordion title="Decentralized applications (dApps)">
+    Use HCS as a lightweight coordination layer — for example, to order bids in an auction, synchronize game state, or sequence votes in a DAO.
+  </Accordion>
+  <Accordion title="Token distribution and airdrops">
+    Publish airdrop eligibility lists or distribution events as messages. Any third party can subscribe to the topic and react without polling a centralized API.
+  </Accordion>
+</AccordionGroup>

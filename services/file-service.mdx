@@ -1,0 +1,165 @@
+---
+title: "File Service"
+description: "Decentralized file storage for contract bytecode, configuration data, and application metadata with full create, append, update, and delete support."
+keywords: ["file service", "HFS", "FileCreate", "FileAppend", "FileUpdate", "FileDelete", "contract bytecode", "decentralized storage"]
+---
+
+The Hedera File Service (HFS) provides a decentralized file storage layer on the Hedera network. Files are stored across all consensus nodes and are tamper-evident — their contents are replicated and hashed in the same merkle state that backs every other network entity.
+
+Files are most commonly used to store smart contract bytecode (referenced by `ContractCreate`), network configuration, fee schedules, and application metadata that must be available on-chain.
+
+## File lifecycle
+
+<Steps>
+  <Step title="Create">
+    Submit a `FileCreate` transaction with the initial contents and an access key list. The network assigns a `FileID` such as `0.0.6789`.
+  </Step>
+  <Step title="Append">
+    Use `FileAppend` to add bytes to an existing file. Because individual transactions are limited in size, large files (e.g. contract bytecode) are written in multiple append operations.
+  </Step>
+  <Step title="Update">
+    Replace the file's contents, keys, or expiration time using `FileUpdate`.
+  </Step>
+  <Step title="Query">
+    Retrieve the full contents with `FileGetContents` or inspect metadata (size, keys, expiration) with `FileGetInfo`.
+  </Step>
+  <Step title="Delete">
+    Mark a file as deleted using `FileDelete`. Deleted files retain their ID and are marked as deleted until their expiration, then they cease to exist.
+  </Step>
+</Steps>
+
+## Transaction types
+
+### FileCreate
+
+Creates a new file with optional initial contents:
+
+```protobuf
+message FileCreateTransactionBody {
+  Timestamp expirationTime = 2;    // When the file expires and ceases to exist
+  KeyList keys = 3;                // All top-level keys must sign to create or modify
+                                   // Any single top-level key can sign to delete
+  bytes contents = 4;              // Initial file contents
+  ShardID shardID = 5;
+  RealmID realmID = 6;
+  Key newRealmAdminKey = 7;
+  string memo = 8;                 // UTF-8, max 100 bytes
+}
+```
+
+<Note>
+A file's `keys` is a `KeyList`, not a single key. **All** keys in the list must sign any create or modify transaction. Any one key can sign a delete transaction.
+</Note>
+
+### FileAppend
+
+Appends bytes to an existing file:
+
+```protobuf
+message FileAppendTransactionBody {
+  FileID fileID = 2;        // Target file
+  bytes contents = 4;       // Bytes to append
+}
+```
+
+Because the maximum transaction size is 6 KiB (or up to 130 KiB for jumbo Ethereum transactions), large payloads such as smart contract initcode must be uploaded in chunks:
+
+1. `FileCreate` with the first chunk of bytecode.
+2. Repeated `FileAppend` calls until all bytecode is uploaded.
+3. Reference the resulting `FileID` in a `ContractCreate` transaction.
+
+### FileUpdate
+
+Replaces a file's keys, contents, expiration time, or memo. Only fields you include in the transaction are changed:
+
+```protobuf
+message FileUpdateTransactionBody {
+  FileID fileID = 2;
+  Timestamp expirationTime = 4;
+  KeyList keys = 5;
+  bytes contents = 6;
+  string memo = 11;
+}
+```
+
+### FileDelete
+
+Marks a file as deleted. The file is not immediately removed; it persists (without contents) until its expiration time:
+
+```protobuf
+message FileDeleteTransactionBody {
+  FileID fileID = 2;
+}
+```
+
+## Query types
+
+### FileGetContents
+
+Returns the raw bytes stored in a file:
+
+```protobuf
+message FileGetContentsQuery {
+  QueryHeader header = 1;
+  FileID fileID = 2;
+}
+```
+
+### FileGetInfo
+
+Returns file metadata — size, expiration time, deletion status, and keys — without returning the contents:
+
+```protobuf
+message FileGetInfoQuery {
+  QueryHeader header = 1;
+  FileID fileID = 2;
+}
+```
+
+## System-level operations
+
+Two privileged operations exist for Hedera system administration:
+
+| Transaction | Purpose |
+|---|---|
+| `SystemDelete` | Marks a file (or contract) as deleted in a way that can be reversed; requires elevated permissions |
+| `SystemUndelete` | Restores a system-deleted file; requires elevated permissions |
+
+These are not available to regular network users.
+
+## Access control
+
+File permissions are governed by the `KeyList` set at creation. The access semantics differ from single-key resources:
+
+- **To create or modify** (update, append): all keys in the top-level key list must sign.
+- **To delete**: any one key in the top-level key list can sign.
+
+If a file has no key list (an "immutable" file), it cannot be modified or deleted by any transaction.
+
+<Warning>
+Immutable files — those created without a `keys` field — can still expire. Once expired they are permanently removed and cannot be recreated with the same `FileID`.
+</Warning>
+
+## Service module layout
+
+| Module | Role |
+|---|---|
+| `hedera-file-service` | `FileService` interface, `FileServiceDefinition`, readable file store |
+| `hedera-file-service-impl` | `FileCreateHandler`, `FileAppendHandler`, `FileUpdateHandler`, `FileDeleteHandler`, `FileGetContentsHandler`, `FileGetInfoHandler`, `FileSystemDeleteHandler`, `FileSystemUndeleteHandler`, schema migrations |
+
+## Use cases
+
+<AccordionGroup>
+  <Accordion title="Smart contract bytecode storage">
+    Contracts larger than 6 KiB must be stored in a file first. The `FileID` is then passed to `ContractCreate` as the `initcodeSource`. This allows auditors and tooling to inspect the bytecode independently of the contract itself.
+  </Accordion>
+  <Accordion title="Network configuration">
+    The fee schedule, exchange rates, HAPI permission settings, and throttle definitions are stored as special system files (IDs 101–112). The network reads these files during consensus to apply configuration changes without a software upgrade.
+  </Accordion>
+  <Accordion title="Application metadata">
+    Store token metadata, governance proposal text, or audit evidence on-chain so that any party can independently retrieve and verify it via a `FileGetContents` query.
+  </Accordion>
+  <Accordion title="Document management">
+    Publish legal agreements, compliance certificates, or supply chain documents to an immutable or append-only file. The file hash in the state record serves as a tamper-evident fingerprint.
+  </Accordion>
+</AccordionGroup>

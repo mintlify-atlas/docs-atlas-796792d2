@@ -1,0 +1,143 @@
+---
+title: "Deployment"
+description: "Build, package, and run a Hiero consensus node — from a single local instance to a multi-node Docker network."
+---
+
+This page covers everything an operator needs to get a consensus node running: prerequisites, building from source, the data directory layout, and starting a multi-node network with Docker Compose.
+
+## Prerequisites
+
+- **JDK 25** — Install the [Eclipse Adoptium](https://adoptium.net/) build of JDK 25. The Gradle build enforces this version and will fail with a descriptive error if `java` resolves to a different JDK. Set `JAVA_HOME` or update your `PATH` before running any Gradle task.
+- **Git** — Any recent version.
+- **Docker and Docker Compose** — Required only for the containerised multi-node workflow.
+
+<Note>
+  You do not need to install Gradle. The repository ships a `gradlew` wrapper script that downloads the correct version automatically.
+</Note>
+
+## Build and run (single node)
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/hiero-ledger/hiero-consensus-node.git
+    cd hiero-consensus-node
+    ```
+  </Step>
+
+  <Step title="Compile and assemble all JARs">
+    ```bash
+    ./gradlew assemble
+    ```
+
+    This compiles every module and produces all JAR artifacts. On a warm Gradle daemon a full build completes in a few minutes. The assembled application ends up in `hedera-node/app/`.
+  </Step>
+
+  <Step title="Start the node">
+    ```bash
+    ./gradlew :app:modrun
+    ```
+
+    This launches a single-node services instance using the Java Platform Module System. The node loads configuration from `hedera-node/configuration/dev/` by default, creates its working directories under the current directory, and starts accepting gRPC connections on port **50211**.
+
+    <Tip>
+      In IntelliJ IDEA you can run the same task from the Gradle tool window instead of the terminal. See the [IntelliJ IDEA quickstart](https://github.com/hiero-ledger/hiero-consensus-node/blob/main/docs/intellij-quickstart.md) for IDE setup instructions.
+    </Tip>
+  </Step>
+</Steps>
+
+## gRPC endpoint
+
+Clients connect to the node's gRPC server on **port 50211**. All Hedera SDK libraries and the `test-clients` module target this port by default when configured for localhost. The port is also exposed in the Docker Compose configuration so the same port mapping applies to containerised deployments.
+
+```bash
+# Quick connectivity check with grpcurl
+grpcurl -plaintext localhost:50211 list
+```
+
+## Docker-based deployment
+
+The repository provides a Docker Compose file at `hedera-node/docker/docker-compose.yml` that spins up a three-node local network. All Docker workflows are driven by Gradle tasks — do not call the Compose file directly.
+
+### Build and push the node image
+
+```bash
+# Build the services-node Docker image and tag it
+./gradlew :hedera-node:docker
+```
+
+### Start the network
+
+```bash
+./gradlew :hedera-node:dockerComposeUp
+```
+
+This starts three containers (`node_0`, `node_1`, `node_2`) using the `services-node` image. Each container receives a `NODE_ID` environment variable so it can locate its own address-book entry.
+
+| Container | Host port | Container port |
+|-----------|-----------|----------------|
+| `node_0`  | `50211`   | `50211`        |
+| `node_1`  | `50212`   | `50211`        |
+| `node_2`  | `50213`   | `50211`        |
+
+### Stop the network
+
+```bash
+./gradlew :hedera-node:dockerComposeDown
+```
+
+## Volume layout
+
+Each container mounts three host directories:
+
+```
+hedera-node/docker/compose-network/
+├── node0/
+│   ├── saved/    # Persisted signed state snapshots
+│   └── output/   # Log files (hgcaa.log, swirlds.log, grpc-access.log, etc.)
+├── node1/
+│   ├── saved/
+│   └── output/
+└── node2/
+    ├── saved/
+    └── output/
+```
+
+The shared configuration directory `hedera-node/configuration/compose/` is mounted read-only into every container at `/opt/hedera/services/config-mount`. It contains:
+
+| File | Purpose |
+|------|---------|
+| `bootstrap.properties` | Overrides applied at network genesis |
+| `application.properties` | Initial values for dynamic network properties (file `0.0.121`) |
+| `node.properties` | Per-node settings (record stream path, Netty mode, etc.) |
+| `config.txt` / `settings.txt` | Platform address book and platform settings |
+| `log4j2.xml` | Log4j2 logging configuration |
+
+## Data directory layout (bare-metal)
+
+When running outside Docker the node reads and writes the following paths relative to its working directory:
+
+```
+data/
+├── config/           # External property overrides (bootstrap.properties, application.properties, node.properties)
+├── saved/            # Signed state snapshots written by the platform
+├── recordStreams/    # Record stream files (.rcd, .rcd_sig)
+├── blockStreams/     # Block stream files
+└── accountBalances/  # Periodic account balance exports
+output/               # Log files
+```
+
+<Warning>
+  The `data/saved/` directory holds the authoritative on-disk state for the node. Back this directory up before performing upgrades or configuration changes that require a restart.
+</Warning>
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card title="Configuration" icon="sliders" href="/operations/configuration">
+    Tune bootstrap, static, dynamic, and node properties for your environment.
+  </Card>
+  <Card title="Monitoring" icon="chart-line" href="/operations/monitoring">
+    Set up log collection, Prometheus metrics, and record stream verification.
+  </Card>
+</CardGroup>

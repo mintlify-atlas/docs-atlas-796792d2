@@ -1,97 +1,77 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Hiero Consensus Node"
+description: "Distributed ledger infrastructure providing crypto, token, consensus, file, and smart contract services using the hashgraph consensus algorithm."
 ---
 
-## Setting up
+Hiero Consensus Node is the reference implementation of a consensus node for Hiero-based distributed ledger networks. Each node participates in the [hashgraph](https://www.swirlds.com/downloads/SWIRLDS-TR-2016-01.pdf) consensus algorithm to order transactions fairly and securely, then executes those transactions to mutate shared network state identically across all nodes.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build, run, and interact with a local consensus node in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand how the Platform SDK and Hedera services fit together.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Core Services" icon="layer-group" href="/services/overview">
+    Explore HCS, HTS, smart contracts, file storage, and more.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Operations" icon="server" href="/operations/deployment">
+    Deploy, configure, and monitor a consensus node.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What is a consensus node?
 
-Everything you need to create world-class documentation.
+A consensus node gossips with every other node in the network to reach agreement on which transactions should execute and in what order. Once consensus is reached, each node executes the transactions in that order, updating its local copy of the state in lockstep with all other nodes.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+Clients interact with nodes through the **Hedera API (HAPI)** — a gRPC interface defined by Protocol Buffers. HAPI exposes two kinds of operations:
 
-## Need inspiration?
+- **Transactions** — requests to mutate network state (e.g. transfer tokens, create a topic)
+- **Queries** — requests to read current network state (e.g. get account balance, fetch file contents)
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+## Key capabilities
+
+<CardGroup cols={2}>
+  <Card title="Hedera Consensus Service" icon="comments" href="/services/consensus-service">
+    Decentralized, tamper-proof message ordering for audit logs, supply chains, and dApps.
+  </Card>
+  <Card title="Hedera Token Service" icon="coins" href="/services/token-service">
+    Native fungible tokens and NFTs with full lifecycle management.
+  </Card>
+  <Card title="Smart Contracts" icon="file-code" href="/services/smart-contract-service">
+    EVM-compatible Solidity contract deployment and execution.
+  </Card>
+  <Card title="File Service" icon="folder-open" href="/services/file-service">
+    Decentralized file storage for contract bytecode and application data.
+  </Card>
+  <Card title="Scheduled Transactions" icon="clock" href="/services/schedule-service">
+    Defer or conditionally execute transactions at a future time.
+  </Card>
+  <Card title="Platform SDK" icon="microchip" href="/platform/overview">
+    The underlying gossip, hashgraph, and state-management layer.
+  </Card>
+</CardGroup>
+
+## Getting started
+
+<Steps>
+  <Step title="Install prerequisites">
+    Install an [Eclipse Adoptium](https://adoptium.net/) build of **JDK 25**. No other tooling is required — the repository includes a self-contained Gradle wrapper.
+  </Step>
+  <Step title="Build the project">
+    Clone the repository and run:
+    ```bash
+    ./gradlew assemble
+    ```
+  </Step>
+  <Step title="Run a local node">
+    Start a single-node services instance:
+    ```bash
+    ./gradlew :app:modrun
+    ```
+    The node exposes a gRPC server on port `50211` by default.
+  </Step>
+  <Step title="Submit your first transaction">
+    Use any [Hedera SDK](https://docs.hedera.com/hedera/sdks-and-apis/sdks) or the `test-clients` module to submit a `CryptoTransfer` or query an account balance.
+  </Step>
+</Steps>

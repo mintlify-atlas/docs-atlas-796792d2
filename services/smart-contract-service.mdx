@@ -1,0 +1,188 @@
+---
+title: "Smart Contract Service"
+description: "EVM-compatible smart contract deployment and execution with Solidity support, gas throttling, and interoperability with HTS and HCS via system contracts."
+keywords: ["smart contracts", "EVM", "Solidity", "ContractCreate", "ContractCall", "system contracts", "gas throttling", "HTS interop"]
+---
+
+The Smart Contract Service allows developers to deploy and invoke Ethereum-compatible smart contracts on the Hedera network. It runs a full implementation of the Ethereum Virtual Machine (EVM) — currently tracking the **Cancun** hard fork — and is exposed as `ContractService` in the service module system.
+
+## EVM compatibility
+
+Hedera's EVM is version-controlled and updated alongside major Ethereum hard forks. The active EVM version is configured via the `contracts.evm.version` system property and locked in at node startup:
+
+| Hedera version | Ethereum fork | Notable changes |
+|---|---|---|
+| `v0.30` | London | Baseline EVM support |
+| `v0.34` | Paris | `DIFFICULTY` → `RANDAO`; hollow account creation (HIP-583) |
+| `v0.38` | Shanghai | `PUSH0` opcode; Solidity ≥ 0.8.20 support |
+| `v0.50` | Cancun | `TSTORE`, `TLOAD`, `MCOPY` opcodes; new `SELFDESTRUCT` semantics |
+| `v0.51` | Cancun | Hedera Account Service system contract at `0x16a` |
+
+<Note>
+Solidity versions up to and including **0.8.9** are broadly supported across all EVM versions. Versions that require opcodes introduced in newer forks (e.g. `PUSH0` in 0.8.20+) require the matching EVM version to be active on the network.
+</Note>
+
+## Transaction types
+
+### ContractCreate
+
+Deploys a new smart contract. The contract bytecode can be supplied inline or by referencing a file previously stored in the File Service:
+
+```protobuf
+message ContractCreateTransactionBody {
+  oneof initcodeSource {
+    FileID fileID = 1;     // Bytecode stored in the File Service
+    bytes initcode = 16;   // Inline bytecode (≤ 6 KiB)
+  }
+  Key adminKey = 3;             // Optional key for contract administration
+  int64 gas = 4;                // Gas limit for the constructor
+  int64 initialBalance = 5;     // HBAR to send to the new contract (in tinybars)
+  Duration autoRenewPeriod = 8;
+  bytes constructorParameters = 9;
+  string memo = 10;
+  int32 maxAutomaticTokenAssociations = 14;
+  AccountID autoRenewAccountId = 15;
+  AccountID stakedAccountId = 17; // Staking target: account
+  int64 stakedNodeId = 18;        // Staking target: node
+}
+```
+
+For large contracts, store the initcode in the File Service first, then reference it by `fileID`.
+
+### ContractCall
+
+Invokes a function on an already-deployed contract:
+
+```protobuf
+message ContractCallTransactionBody {
+  ContractID contractID = 1;
+  int64 gas = 2;               // Gas limit
+  int64 amount = 3;            // HBAR to send (tinybars)
+  bytes functionParameters = 4; // ABI-encoded call data
+}
+```
+
+### ContractCallLocal
+
+Executes a read-only contract call locally on the responding node, without reaching consensus. Results are not committed to state. This is equivalent to `eth_call` in Ethereum:
+
+```protobuf
+message ContractCallLocalQuery {
+  QueryHeader header = 1;
+  ContractID contractID = 2;
+  int64 gas = 3;
+  bytes functionParameters = 4;
+  int64 maxResultSize = 5;
+}
+```
+
+<Tip>
+Use `ContractCallLocal` for view functions and simulations. It does not consume throttle capacity and has no network fee beyond the query payment.
+</Tip>
+
+## Gas throttling
+
+Gas usage is throttled at two independent points to protect network resources:
+
+| Throttle point | What it limits |
+|---|---|
+| **Frontend (ingest) gas limit** | Maximum gas across all transactions accepted per second before reaching consensus |
+| **Consensus gas limit** | Maximum gas executed per consensus second across the network |
+
+If either limit is exceeded, the transaction is rejected or throttled. Both limits are configurable via system properties and exposed through the throttle configuration file.
+
+### Intrinsic gas
+
+Every transaction submitted to the Smart Contract Service must provide enough gas to cover its **intrinsic cost**, calculated as:
+
+```
+21,000
++ (4 × number of zero bytes in payload)
++ (16 × number of non-zero bytes in payload)
+```
+
+If a transaction provides less gas than its intrinsic cost, it fails during pre-check and no record is created.
+
+### System contract gas pricing
+
+Gas for Hedera-specific system contract calls is derived from the canonical HAPI price for the equivalent operation, then marked up by 20% to account for system contract overhead. For example:
+
+| System contract function | Canonical price | Contract |
+|---|---|---|
+| `mintToken` (fungible) | $0.001 | HTS |
+| `mintToken` (NFT) | $0.02 | HTS |
+| `createFungibleToken` | $1.00 | HTS |
+| `associate` / `dissociate` | $0.05 | HTS |
+| `cryptoTransfer` | $0.001 per FT + $0.002 per NFT | HTS |
+| `hbarApprove` | $0.05 | HAS |
+
+## System contract interoperability
+
+The Smart Contract Service exposes Hedera-native functionality to Solidity code through **system contracts** deployed at well-known addresses. Your contracts can call these addresses directly using the standard Solidity `call` syntax or dedicated interface libraries.
+
+<AccordionGroup>
+  <Accordion title="Hedera Token Service (HTS) — 0x167">
+    Provides full HTS functionality from within a contract: create tokens, mint, burn, transfer, associate, dissociate, apply KYC, freeze accounts, set custom fees, and more.
+
+    ```solidity
+    // Associate the calling contract with a token
+    (bool success, bytes memory result) = address(0x167).call(
+        abi.encodeWithSignature("associateToken(address,address)", account, token)
+    );
+    ```
+
+    The `IHederaTokenService` interface (available from the Hedera smart contract libraries) provides typed wrappers for all HTS functions.
+  </Accordion>
+  <Accordion title="Hedera Consensus Service (HCS) — redirect">
+    Topics can be targeted from smart contracts to submit messages on-chain, enabling contracts to emit verifiable, timestamped events to an HCS topic.
+  </Accordion>
+  <Accordion title="Hedera Account Service (HAS) — 0x16a">
+    Provides address translation and authorization primitives: resolve Hedera account IDs from EVM addresses, check virtual address membership, and validate signatures against Hedera key structures.
+
+    | Function | Signature | Returns |
+    |---|---|---|
+    | `getVirtualAddresses` | `(address)` | `address[]` |
+    | `getHederaAddress` | `(address)` | `(responseCode, address)` |
+    | `isAuthorized` | `(address, bytes32, bytes)` | `bool` |
+    | `isAuthorizedRaw` | `(address, bytes32, bytes)` | `bool` |
+  </Accordion>
+  <Accordion title="Schedule Service system contract">
+    Contracts can create and sign scheduled transactions from within an EVM call, enabling on-chain multi-signature workflows that interact with native HAPI operations.
+  </Accordion>
+</AccordionGroup>
+
+## Ethereum transaction support
+
+The network accepts raw Ethereum transactions (`EthereumTransaction`) in addition to HAPI `ContractCall` and `ContractCreate`. This allows existing Ethereum tooling (MetaMask, Hardhat, Foundry, ethers.js) to target Hedera without modification.
+
+<Warning>
+Jumbo Ethereum transactions (call data > 6 KiB, up to 128 KiB) are supported when the `jumboTransactions` feature flag is enabled. They are subject to a separate bytes-per-second throttle bucket in addition to the standard gas throttle.
+</Warning>
+
+## Service module layout
+
+| Module | Role |
+|---|---|
+| `hedera-smart-contract-service` | `ContractService` interface, `SmartContractServiceDefinition`, `ReadableEvmHookStore` |
+| `hedera-smart-contract-service-impl` | EVM execution engine (Besu), handler implementations, system precompiles, Dagger wiring |
+
+```java
+ContractService cs = ContractService.getInstance();
+```
+
+## Use cases
+
+<AccordionGroup>
+  <Accordion title="Decentralized finance (DeFi)">
+    Deploy AMMs, lending protocols, and derivative contracts. Use HTS system contract calls to atomically transfer native tokens within the same EVM transaction.
+  </Accordion>
+  <Accordion title="Tokenized assets">
+    Combine HTS token creation (via the system contract) with custom ERC-20-compatible wrapper contracts to bridge Hedera native tokens and EVM tooling ecosystems.
+  </Accordion>
+  <Accordion title="Automated workflows">
+    Use the Schedule Service system contract to schedule future HAPI transactions from within a smart contract execution, enabling on-chain governance and time-locked operations.
+  </Accordion>
+  <Accordion title="NFT marketplaces">
+    Issue NFTs via HTS (lower cost than ERC-721), then use smart contracts for marketplace logic — bidding, royalty distribution, and escrow — all in a single atomic transaction.
+  </Accordion>
+</AccordionGroup>

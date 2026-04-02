@@ -1,0 +1,158 @@
+---
+title: "Development Setup"
+description: "Set up your local environment to build, run, and contribute to Hiero Consensus Node."
+keywords: ["development", "setup", "gradle", "intellij", "jdk", "build"]
+---
+
+## Prerequisites
+
+You need an [Eclipse Adoptium](https://adoptium.net/) build of JDK **25.0.2** (Eclipse Temurin). No other JDK version is supported — the build system validates the JDK on startup and fails if you use a different version.
+
+You do not need to install Gradle. The repository includes a `gradlew` wrapper script that automatically downloads and uses the correct Gradle version for the project.
+
+<Info>
+  Set your `JAVA_HOME` environment variable or ensure the `java` command on your `PATH` points to the Temurin 25.0.2 JDK before running any Gradle commands.
+</Info>
+
+## Clone the repository
+
+```bash
+git clone https://github.com/hiero-ledger/hiero-consensus-node.git
+cd hiero-consensus-node
+```
+
+## Build with Gradle
+
+<Steps>
+  <Step title="Compile all code and produce JAR files">
+    ```bash
+    ./gradlew assemble
+    ```
+
+    This compiles every module and writes build artifacts to the `build/` directories. You can run this at any time to verify that the code compiles cleanly.
+  </Step>
+
+  <Step title="Run quality checks">
+    ```bash
+    ./gradlew qualityGate
+    ```
+
+    This runs `assemble` plus all static analysis checks (Spotless, Checkstyle, SpotBugs) and auto-fixes formatting where possible. Always run this before pushing a branch.
+  </Step>
+
+  <Step title="Start a local single-node network">
+    ```bash
+    ./gradlew :app:modrun
+    ```
+
+    This launches the `ServicesMain` process as a single-node network named "Alice". The gRPC server binds to port `50211` by default.
+  </Step>
+</Steps>
+
+### Other useful Gradle tasks
+
+| Task | Description |
+|------|-------------|
+| `./gradlew` (no arguments) | Prints a full overview of available tasks |
+| `./gradlew :<module>:test` | Runs unit tests for a single module |
+| `./gradlew :<module>:itest` | Runs integration tests for a single module |
+| `./gradlew clean` | Deletes all `build/` directories to free disk space |
+| `./gradlew :test-clients:runTestClient -PtestClient=...` | Runs an end-to-end test client against a local network |
+
+<Tip>
+  Cleaning is not required for correct build results. Use `./gradlew clean` only when you need to reclaim disk space.
+</Tip>
+
+## IntelliJ IDEA setup
+
+<Steps>
+  <Step title="Open the project">
+    In IntelliJ, choose **File → Open** and select the `hiero-consensus-node/` directory you cloned. IntelliJ imports it as a Gradle project automatically.
+  </Step>
+
+  <Step title="Configure the Gradle JDK">
+    Go to **Settings → Build, Execution, Deployment → Build Tools → Gradle** and set the Gradle JVM to **Eclipse Temurin 25.0.2**. You can use IntelliJ's built-in JDK downloader if the JDK is not already installed on your machine.
+  </Step>
+
+  <Step title="Reload the Gradle project">
+    Click **Reload All Gradle Projects** in the Gradle tool window. You must repeat this step whenever you change `build.gradle.kts` files, `module-info.java` dependencies, or build configuration under `gradle/plugins/`.
+  </Step>
+
+  <Step title="Run tasks from the Gradle tool window">
+    All tasks described in this guide are also available from the **Gradle** tool window. Expand the task tree to find `assemble`, `qualityGate`, `modrun`, and test tasks for each module.
+  </Step>
+</Steps>
+
+### Recommended IDE settings
+
+To avoid import conflicts with SpotBugs annotations, add `javax.annotation` and `org.jetbrains.annotations` to **Editor → General → Auto Import → Exclude from auto-import and completion**. The project uses only SpotBugs annotations; `javax` and JetBrains annotation types are not used.
+
+### Optional IntelliJ plugins
+
+<CardGroup cols={2}>
+  <Card title="Android plugin" icon="android" href="https://plugins.jetbrains.com/plugin/22989-android">
+    Adds code-navigation support for Dagger 2 annotated interfaces used in the codebase.
+  </Card>
+  <Card title="JMH plugin" icon="gauge" href="https://plugins.jetbrains.com/plugin/7529-jmh-java-microbenchmark-harness">
+    Lets you run individual JMH micro-benchmarks directly from the IDE without a Gradle task.
+  </Card>
+</CardGroup>
+
+## Branch naming conventions
+
+Every short-lived branch must be linked to a GitHub issue. No branch should be merged to `main` without an approved pull request.
+
+### Feature, bugfix, and hotfix branches
+
+Use the format `<ticket_number>-<short_desc>`:
+
+- `<ticket_number>` — the five-digit, left-zero-padded GitHub issue number
+- `<short_desc>` — up to 20 alphanumeric characters and hyphens; no slashes
+
+```bash
+# Examples
+04647-eventflow-design
+00034-refactor-incron
+```
+
+### Release branches
+
+```bash
+release/<major>.<minor>
+
+# Examples
+release/0.6
+release/1.8
+```
+
+### Tags
+
+Tags follow semantic versioning with the `v` prefix. Pre-release identifiers are limited to `alpha`, `beta`, and `rc`.
+
+```bash
+# Examples
+v1.8.1
+v0.24.0-alpha.1
+v1.8.1-rc.0
+```
+
+## Commit signing and DCO
+
+All commits must be GPG-signed and include a Developer Certificate of Origin (DCO) sign-off. Set up your GPG key and configure Git before your first commit:
+
+```bash
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+```
+
+Then sign off each commit with the `-s` flag:
+
+```bash
+git commit -s -m "Your commit message"
+```
+
+The `Signed-off-by` trailer must match your `Author` line exactly. The automated DCO check rejects pull requests where they differ.
+
+## Modifying the build configuration
+
+Gradle build logic lives in `gradle/plugins/src/main/kotlin/` as Kotlin DSL convention plugins (`*.gradle.kts`). Edit those files to change how modules are compiled, tested, or packaged. Refer to the [Hiero Gradle Conventions documentation](https://github.com/hiero-ledger/hiero-gradle-conventions#build) for details.

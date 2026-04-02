@@ -1,0 +1,112 @@
+---
+title: "Services overview"
+description: "How the SPI-based service architecture works and what each core service provides."
+keywords: ["services", "SPI", "hedera-app-spi", "service modules", "HCS", "HTS", "smart contracts"]
+---
+
+The consensus node exposes its functionality through a set of independently packaged **service modules**. Each service implements a common `Service` interface defined in `hedera-app-spi`, which acts as the service provider interface (SPI) for the entire application.
+
+## Service module architecture
+
+Every service is split into two Gradle modules:
+
+| Module pattern | Purpose |
+|---|---|
+| `hedera-[name]-service` | Public API — interfaces, stores, and stream builders exposed to other modules |
+| `hedera-[name]-service-impl` | Private implementation — handlers, Dagger wiring, and schema migrations |
+
+The API module exports its packages and declares the service interface via the Java `uses` keyword in `module-info.java`. The implementation module uses `provides` to register the concrete class with the Java Service Loader:
+
+```java
+// hedera-foo-service/module-info.java
+module com.hedera.node.app.service.foo {
+    exports com.hedera.node.app.service.foo;
+    uses com.hedera.node.app.service.foo.FooService;
+    requires transitive com.hedera.node.app.spi;
+}
+```
+
+```java
+// hedera-foo-service-impl/module-info.java
+module com.hedera.node.app.service.foo.impl {
+    requires transitive com.hedera.node.app.service.foo;
+    provides com.hedera.node.app.service.foo.FooService
+        with com.hedera.node.app.service.foo.impl.FooServiceImpl;
+}
+```
+
+Callers obtain a service instance through a static factory on the service interface — no reflection boilerplate required:
+
+```java
+final FooService service = FooService.getInstance();
+```
+
+<Note>
+The `hedera-app` module is the only place that depends on *implementation* modules at compile time. All other modules depend solely on the API module and declare the implementation as a `runtimeOnly` Gradle dependency.
+</Note>
+
+## How `hedera-app-spi` ties services together
+
+`hedera-app-spi` defines the foundational types that all services share:
+
+- **`RpcService`** — base interface for any service that handles HAPI RPCs
+- **`ServiceFactory`** — utility that wraps `ServiceLoader` to load a service implementation
+- **`TransactionHandler` / `QueryHandler`** — interfaces that each handler implements
+- **`HandleContext` / `PreHandleContext` / `FeeContext`** — context objects passed into handlers at each lifecycle phase
+
+Each service implementation acts as a factory for its handlers and as the entry point into all state the service manages.
+
+## Handler lifecycle
+
+Every transaction handler goes through three phases before state is mutated:
+
+<Steps>
+  <Step title="pureChecks">
+    Stateless validation of the transaction body fields. Runs before any state is read.
+  </Step>
+  <Step title="preHandle">
+    Determines which cryptographic keys must sign the transaction. Adds required keys to the `PreHandleContext`.
+  </Step>
+  <Step title="handle">
+    Executes the main business logic. Reads and writes state via the service's writable stores and calculates fees.
+  </Step>
+</Steps>
+
+## Core services
+
+<CardGroup cols={2}>
+  <Card title="Hedera Consensus Service (HCS)" icon="comments" href="/services/consensus-service">
+    Decentralized message ordering with trusted consensus timestamps. Use for audit logs, supply chains, and dApps.
+  </Card>
+  <Card title="Hedera Token Service (HTS)" icon="coins" href="/services/token-service">
+    Native fungible tokens and NFTs with full lifecycle management — mint, burn, transfer, wipe, KYC, and custom fees.
+  </Card>
+  <Card title="Smart Contract Service" icon="file-code" href="/services/smart-contract-service">
+    EVM-compatible smart contract deployment and execution with Solidity support and system contract interoperability.
+  </Card>
+  <Card title="File Service" icon="folder-open" href="/services/file-service">
+    Decentralized file storage for contract bytecode, configuration data, and application metadata.
+  </Card>
+  <Card title="Schedule Service" icon="clock" href="/services/schedule-service">
+    Deferred and multi-signature transactions that execute once all required parties have signed.
+  </Card>
+  <Card title="Crypto / Account Service" icon="user" href="/services/token-service">
+    Account creation and management, HBAR transfers, and allowances — co-located in the Token Service module.
+  </Card>
+</CardGroup>
+
+## Additional services
+
+Three more service modules complete the full HAPI surface. They are wired into `hedera-app` the same way as the core services above.
+
+<CardGroup cols={2}>
+  <Card title="Network Admin Service" icon="shield-halved">
+    Handles network-level queries (`NetworkGetVersionInfo`, `NetworkGetAccountDetails`, `NetworkGetByKey`, `TransactionGetReceipt`, `TransactionGetRecord`) and the `Freeze` transaction that initiates a coordinated software upgrade. Implemented in `hedera-network-admin-service` / `hedera-network-admin-service-impl`.
+  </Card>
+  <Card title="Address Book Service" icon="address-book">
+    Manages the network's node address book — adding, updating, and removing nodes via `NodeCreate`, `NodeUpdate`, and `NodeDelete` transactions. Implemented in `hedera-addressbook-service` / `hedera-addressbook-service-impl`.
+  </Card>
+  <Card title="Util Service" icon="screwdriver-wrench">
+    Provides the `UtilPrng` transaction (deterministic pseudo-random number generation) and the `AtomicBatch` transaction for grouping multiple operations. Implemented in `hedera-util-service` / `hedera-util-service-impl`.
+  </Card>
+</CardGroup>

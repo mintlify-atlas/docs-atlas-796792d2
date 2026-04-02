@@ -1,0 +1,175 @@
+---
+title: "Monitoring"
+description: "Collect logs, expose Prometheus metrics, and verify record stream output from a running Hiero consensus node."
+---
+
+A production consensus node produces three categories of observable output: structured **log files**, Prometheus-compatible **metrics**, and cryptographically signed **record stream files**. Together they cover operational health, performance trending, and transaction auditability.
+
+## Log files
+
+The node uses **Log4j2** for structured, configurable logging. The configuration file lives at `configuration/<env>/log4j2.xml` and is bind-mounted into each container at startup.
+
+### Log files produced
+
+| File | Content |
+|------|---------|
+| `output/hgcaa.log` | Primary application log — all `com.hedera.*` events at INFO and above |
+| `output/swirlds.log` | Platform SDK log — consensus, gossip, state, reconnect events |
+| `output/swirlds-vmap.log` | MerkleDb and virtual Merkle statistics |
+| `output/swirlds-hashstream/swirlds-hashstream.log` | State hash stream log |
+| `output/grpc-access.log` | One line per inbound gRPC request (access log) |
+| `output/queries.log` | Query handler log — rate-limited to 50 events/s with a burst of 500 |
+| `output/transaction-state/state-changes.log` | Per-transaction state transition log |
+| `output/block-node-comms.log` | Block node communication events |
+
+All rolling files cap at **100 MB** per file and keep up to **10** rotated copies. The transaction state log caps at 50 MB.
+
+### Log levels
+
+The default production configuration sets:
+
+- `com.hedera.*` — `INFO`
+- `org.hiero.*` — `INFO`
+- `Root` — `FATAL`
+
+Fine-grained markers (e.g. `SYNC`, `CREATE_EVENT`, `HEARTBEAT`) are individually toggled via `MarkerFilter` entries in `log4j2.xml`. Markers relevant to startup, reconnect, freeze, and state snapshots are enabled by default; gossip and event-creation debug markers are disabled.
+
+Log4j2 re-reads `log4j2.xml` every **600 seconds** (`monitorInterval="600"`), so you can adjust log levels without restarting the node.
+
+### Adjusting log verbosity
+
+To temporarily enable debug-level gossip logging, edit `log4j2.xml` and change the relevant `MarkerFilter` from `onMatch="DENY"` to `onMatch="ACCEPT"`:
+
+```xml
+<!-- Enable gossip sync debug logging -->
+<MarkerFilter marker="SYNC" onMatch="ACCEPT" onMismatch="NEUTRAL"/>
+```
+
+The change takes effect within 10 minutes with no node restart required.
+
+## Metrics
+
+The node exposes Prometheus-compatible metrics through the platform SDK metrics infrastructure. Metrics are registered in a `MetricRegistry` to prevent conflicts and emitted via a `SnapshotService` on a periodic interval.
+
+### Metric scopes
+
+| Scope | Description |
+|-------|-------------|
+| **Global metrics** | One instance per JVM — covers cryptographic primitives, JVM memory, OS resources |
+| **Platform metrics** | One set per platform instance — covers consensus, gossip, state, and event processing |
+
+Platform metrics also include all global metrics when exported, so a single Prometheus scrape captures the complete picture.
+
+### Metric categories
+
+The following categories are emitted by a running node:
+
+<AccordionGroup>
+  <Accordion title="Consensus and platform">
+    - **Events created / received / discarded** — rates of event production and intake through the gossip layer.
+    - **Rounds per second** — throughput of the hashgraph consensus algorithm.
+    - **Transactions per second (TPS)** — consensus TPS as measured at the backend handle workflow.
+    - **Signed state writes** — frequency and duration of state snapshot writes to `data/saved/`.
+    - **Reconnect events** — count and duration of reconnect cycles.
+    - **Platform status transitions** — tracks moves between `STARTING`, `ACTIVE`, `BEHIND`, `RECONNECT_COMPLETE`, `FREEZE_COMPLETE`, etc.
+  </Accordion>
+
+  <Accordion title="Transaction ingestion">
+    - **Ingest throttle denials** — count of `BUSY` responses per operation type.
+    - **Consensus throttle denials** — count of `THROTTLED_AT_CONSENSUS` and `CONSENSUS_GAS_EXHAUSTED` responses.
+    - **Transaction queue depth** — how many transactions are waiting in the ingest pipeline.
+    - **Gas usage per second** — current frontend and backend gas consumption versus the configured limits.
+  </Accordion>
+
+  <Accordion title="Fee and congestion">
+    - **Congestion multiplier** — the current active fee multiplier (1 during normal operation, higher during congestion events).
+    - **Throttle bucket utilisation** — fill percentage of each named throttle bucket (`ThroughputLimits`, `PriorityReservations`, etc.).
+  </Accordion>
+
+  <Accordion title="State and storage">
+    - **Entity counts** — number of accounts, tokens, topics, contracts, schedules currently in state.
+    - **MerkleDb statistics** — read/write throughput, cache hit rates, flush durations.
+    - **Virtual Merkle stats** — node counts and rehash timings.
+  </Accordion>
+</AccordionGroup>
+
+### Prometheus scrape endpoint
+
+Metrics are served at the standard Prometheus scrape path. Configure your Prometheus instance to scrape the node:
+
+```yaml
+# prometheus.yml snippet
+scrape_configs:
+  - job_name: hiero_consensus_node
+    static_configs:
+      - targets:
+          - "node0:9090"
+          - "node1:9090"
+          - "node2:9090"
+    scrape_interval: 15s
+```
+
+<Note>
+  The exact metrics port is configurable via platform settings. Check `settings.txt` or the platform configuration documentation for the active value in your deployment.
+</Note>
+
+## Record stream files
+
+Every transaction that reaches consensus produces a **record stream entry**. The node writes these entries as signed binary files to the directory specified by the node property `hedera.recordStream.logDir` (default: `data/recordStreams/`).
+
+### What record stream files contain
+
+Each record stream file (`.rcd`) contains:
+
+- The transaction body (protobuf-encoded).
+- The `TransactionRecord` — the authoritative outcome, including:
+  - Consensus timestamp.
+  - Transaction status (`SUCCESS`, `INVALID_SIGNATURE`, etc.).
+  - Transfer list (all ℏ movements, including fees).
+  - Token transfer lists (for HTS operations).
+  - Assessed custom fees.
+  - Contract call result or create result (for smart contract transactions).
+  - Child transaction records for triggered auto-associations, auto-renewals, etc.
+- A running hash chaining this record to all previous records.
+
+Accompanying `.rcd_sig` files contain the node's signature over the record file hash, enabling mirror nodes and auditors to verify authenticity.
+
+### Sidecar records
+
+Extended data (EVM call traces, state changes, contract bytecode) can be written to a separate sidecar directory configured by `hedera.recordStream.sidecarDir`. Leaving this property empty disables sidecar output.
+
+### Block streams
+
+Block stream files (`.blk`) are written to `blockStream.blockFileDir` (default: `data/blockStreams/`). Block streams are the newer format for conveying ordered transaction data to block nodes and mirror nodes.
+
+### Verifying record integrity
+
+Mirror node operators verify that:
+
+1. The running hash in each `.rcd` file extends the hash chain from the previous file.
+2. At least one-third of nodes have provided matching `.rcd_sig` signatures over the same file hash.
+
+This two-step verification proves that the records were produced by a legitimate supermajority of the network.
+
+## Alert recommendations
+
+The following conditions warrant operator attention:
+
+| Condition | Indicator | Action |
+|-----------|-----------|--------|
+| Node falling behind consensus | Platform status `BEHIND` in logs (`PLATFORM_STATUS` marker) | Check network connectivity and hardware resources |
+| Congestion multiplier elevated | `fees.percentCongestionMultipliers` threshold crossed | Investigate transaction volume spike; consider rate limits at ingress |
+| Record stream gap | Missing or unsigned `.rcd` files | Check disk space and `hedera.recordStream.logDir` permissions |
+| Reconnect triggered | `RECONNECT` marker in `swirlds.log` | Review network partition events and node peer connectivity |
+| State snapshot failure | `STATE_TO_DISK` marker absent for extended period | Check `data/saved/` disk space and I/O health |
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card title="Deployment" icon="server" href="/operations/deployment">
+    Review the data directory layout and Docker volume configuration.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/operations/configuration">
+    Adjust log paths, record stream directories, and Netty settings via node properties.
+  </Card>
+</CardGroup>

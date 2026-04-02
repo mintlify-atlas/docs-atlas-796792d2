@@ -1,0 +1,112 @@
+---
+title: "Introduction"
+description: "What Hiero Consensus Node is, who it's for, and how it fits into the broader Hiero/Hedera ecosystem."
+keywords: ["hiero", "consensus node", "hashgraph", "HAPI", "distributed ledger", "hedera"]
+---
+
+Hiero Consensus Node is the reference implementation of a consensus node for Hiero-based distributed ledger networks. It implements the cryptocurrency, consensus, smart contract, file, token, and scheduling services offered by nodes in the Hedera public network, running on top of the Platform SDK — the underlying gossip and hashgraph layer.
+
+## What problem it solves
+
+A decentralized distributed ledger faces one fundamental challenge: ordering transactions in a way that is fast, fair, and secure across nodes that don't inherently trust each other. Hiero Consensus Node solves this using the [hashgraph consensus algorithm](https://www.swirlds.com/downloads/SWIRLDS-TR-2016-01.pdf), which provides Byzantine fault-tolerant consensus without requiring proof-of-work or leader election.
+
+Every consensus node gossips with every other node, exchanges signed events, and uses the virtual voting property of the hashgraph to determine a globally agreed transaction order — without any additional voting rounds. Once consensus order is determined, all nodes execute transactions in that same order, producing identical state transitions.
+
+## Who it's for
+
+- **Protocol and infrastructure engineers** who need to understand, extend, or debug the node software itself
+- **Network operators** deploying and running consensus nodes in production or test networks
+- **Service developers** building new Hedera services that plug into the application layer via the SPI
+- **Application developers** who want a deep understanding of what happens to their transactions after they are submitted
+
+## Consensus nodes and mirror nodes
+
+A Hiero network has two distinct types of nodes:
+
+| | Consensus node | Mirror node |
+|---|---|---|
+| **Role** | Participates in hashgraph consensus, executes transactions, maintains authoritative state | Downloads record/event files, indexes them, serves read-heavy APIs |
+| **State** | Full, live merkle tree of all network entities | Indexed database derived from record files |
+| **API** | HAPI gRPC (transactions + queries) | REST, GraphQL, Rosetta, JSON-RPC |
+| **Writes** | Accepts and processes new transactions | Read-only |
+| **Operated by** | Council members and permissioned operators | Any party with sufficient storage |
+
+Consensus nodes write state snapshots, event files, and record files to S3-compatible storage. Mirror nodes consume those outputs asynchronously. Clients that only need historical or read-heavy access should use a mirror node API; clients that need to submit transactions or require the freshest possible state must connect to a consensus node.
+
+## The Hedera API (HAPI)
+
+Each consensus node exposes **HAPI** — a gRPC interface defined by Protocol Buffer files in the `hapi/hedera-protobuf-java-api` module. HAPI has two operation types:
+
+### Transactions
+
+A transaction is a request to mutate network state. Examples include:
+
+- `CryptoTransfer` — transfer hbar between accounts
+- `TokenCreate` — create a new fungible or non-fungible token
+- `ConsensusSubmitMessage` — append a message to a topic
+- `ContractCall` — invoke a Solidity smart contract function
+- `ScheduleCreate` — schedule a future transaction
+
+Every transaction must be signed by keys that satisfy the authorisation requirements of the affected entities. Transactions carry a `transactionFee` field; the network charges the payer account in hbar (ℏ) once the transaction reaches consensus.
+
+### Queries
+
+A query is a request to read current network state without mutating it. Examples include:
+
+- `CryptoGetAccountBalance` — return the hbar balance for an account
+- `FileGetContents` — return the contents of an on-chain file
+- `ContractGetInfo` — return metadata for a deployed contract
+- `TransactionGetRecord` — return the record produced for a past transaction
+
+Most queries require a `CryptoTransfer` payment in the query header to compensate the receiving node.
+
+<Note>
+  HAPI is defined entirely by Protocol Buffers. The canonical `.proto` files live in the [`hapi/hedera-protobuf-java-api`](https://github.com/hiero-ledger/hiero-consensus-node/tree/main/hapi/hedera-protobuf-java-api) module and are shared with client SDKs.
+</Note>
+
+## Key components
+
+Hiero Consensus Node is divided into two broad layers:
+
+### Platform SDK (`platform-sdk/`)
+
+The Platform SDK provides the infrastructure that any distributed application needs to achieve hashgraph consensus. It is independent of Hedera services — no application code leaks into the platform. The SDK is split into three areas:
+
+- **Base** — common utilities: logging, configuration, metrics, thread management
+- **Core** — gossip protocol, hashgraph algorithm, event intake, pre-consensus event stream, post-consensus event stream, state signing, reconnect, and freeze
+- **Data** — merkle data structures (`VirtualMap`, `MerkleDB`) for holding and fast-copying ledger state
+
+### Hedera services (`hedera-node/`)
+
+The application layer implements the Hedera service APIs on top of the Platform SDK. It contains:
+
+- **`hedera-app`** — the main entry point; owns application lifecycle, gRPC server setup, hashgraph platform integration, state management, throttling, fee handling, and all transaction/query workflows
+- **`hedera-app-spi`** (also referred to as `hedera-app-api`) — the Service Provider Interface that isolates individual service modules from `hedera-app` implementation details
+- **Service modules** — one pair of modules per service (API + implementation), for example `hedera-token-service-api` and `hedera-token-service`
+
+<Tip>
+  Because each service module depends only on `hedera-app-spi` and not on `hedera-app`, you can build, test, and reason about any service in complete isolation — without running a full consensus node.
+</Tip>
+
+## Entity model and permissions
+
+Network state consists of named entities — accounts, topics, files, contracts, tokens, and scheduled transactions — each identified by a `shard.realm.num` triplet (for example, `0.0.12345`). Entities are controlled by one or more Ed25519 or ECDSA(secp256k1) keys arranged in a **Hedera key** hierarchy. An entity whose key is empty is immutable.
+
+Mutating a key-controlled entity requires that the transaction be signed by a sufficient subset of the keys specified in that entity's Hedera key. The `hedera-app` module verifies key requirements during the pre-handle and handle workflows.
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand the two-layer design, module graph, SPI pattern, and transaction lifecycle in detail.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build the project and submit your first transaction to a local node.
+  </Card>
+  <Card title="Core services" icon="layer-group" href="/services/overview">
+    Explore HCS, HTS, smart contracts, file storage, scheduling, and more.
+  </Card>
+  <Card title="Operations" icon="server" href="/operations/deployment">
+    Deploy, configure, and monitor a consensus node in production.
+  </Card>
+</CardGroup>

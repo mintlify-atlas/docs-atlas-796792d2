@@ -1,0 +1,172 @@
+---
+title: "Fees"
+description: "How Hiero consensus node calculates transaction fees — fee components, hbar denomination, the fee schedule, automated congestion pricing, and custom token fees."
+---
+
+Every transaction submitted to the network incurs a fee paid in **ℏ (hbar)**. Fees compensate the three parties that work together to process and store a transaction: the node that ingests it, the network that reaches consensus, and the service that executes it.
+
+## Fee components
+
+Each transaction fee is split into three components:
+
+| Component | Paid to | Purpose |
+|-----------|---------|---------|
+| **Node fee** | The receiving node (`account 0.0.3` by default) | Covers the cost of the node accepting and forwarding the transaction |
+| **Network fee** | The Hedera network fee collection account | Covers bandwidth and consensus overhead across all nodes |
+| **Service fee** | The service-specific treasury | Covers the cost of executing and persisting the transaction outcome |
+
+The total fee a payer sees is `node fee + network fee + service fee`.
+
+<Info>
+  Scheduled transactions are an exception: the inner transaction has no node or network fee. Only the service fee applies when the scheduled transaction executes.
+</Info>
+
+## How fees are calculated
+
+Fees are a function of **resource usage**, not a flat rate. The inputs to the fee calculation include:
+
+- The size of the protobuf-encoded signature map (bytes).
+- The length of the transaction memo (UTF-8 characters).
+- The number of signatures verified.
+- The number of cryptographic keys on the payer account.
+- Transaction-type-specific inputs (e.g. number of token transfers, contract gas usage).
+- The current ℏ/USD exchange rate (from system file `0.0.112`).
+- The percentage of entity space consumed (affects state-storage pricing).
+- Backend throttle utilisation (used for congestion pricing).
+
+The fee schedule (system file `0.0.111`) publishes the USD price of each fee component for every HAPI operation. The node converts those USD prices to ℏ using the current exchange rate at the time of ingest.
+
+## The fee schedule
+
+The fee schedule is stored in system file **`0.0.111`** (`files.feeSchedules`). It is a protobuf-encoded `CurrentAndNextFeeSchedule` message that defines the USD cost of each fee component for each `HederaFunctionality`.
+
+Only authorised accounts can update the fee schedule:
+
+| Account | Role |
+|---------|------|
+| `0.0.2` | Treasury |
+| `0.0.50` | System admin |
+| `0.0.56` | Fee schedules admin |
+
+Submit a `FileUpdate` transaction to `0.0.111` with the new schedule to change pricing. Changes take effect as soon as the transaction reaches consensus.
+
+## Smart contract fees
+
+Smart contract fees follow a different model because the exact execution cost is unknown at ingest time. The node:
+
+1. Checks that the payer has enough ℏ to cover the **maximum gas** specified in the transaction.
+2. Proceeds to execute the contract.
+3. **Refunds** any ℏ corresponding to unused gas after execution completes.
+
+The EVM relay (for Ethereum-compatible transactions) complicates this further: both the relay and the payer may be involved in paying fees and receiving refunds. If the payer cannot cover the maximum gas, the transaction is rejected at ingest before reaching consensus.
+
+## Automated congestion pricing
+
+The network can automatically multiply fees during sustained periods of high load. This discourages non-urgent traffic and provides economic relief to time-sensitive transactions.
+
+### How congestion is measured
+
+Congestion is measured at the **backend (consensus) throttle**, not the frontend. The network monitors the fill level of the throttle bucket(s) assigned to `CryptoTransfer` (by default the `ThroughputLimits` bucket). If the most-loaded bucket is at `x%` capacity, congestion is `x%`.
+
+<Note>
+  Congestion buckets drain with **consensus time**, not wall-clock time. A congestion reading reflects how fast the network is processing transactions relative to its consensus capacity, not how busy any single node's gRPC server is.
+</Note>
+
+### Configuration
+
+Two dynamic properties control automated congestion pricing:
+
+```properties
+fees.minCongestionPeriod=60
+fees.percentCongestionMultipliers=90,10x,95,25x,99,100x
+```
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `fees.minCongestionPeriod` | `60` | Minimum seconds congestion must stay at a given level before the corresponding multiplier activates |
+| `fees.percentCongestionMultipliers` | `90,10x,95,25x,99,100x` | Comma-separated pairs of `<congestion%>,<multiplier>` |
+
+The multiplier pairs are read left-to-right. Each pair defines a threshold: once congestion stays above that percentage for `minCongestionPeriod` seconds, the multiplier applies. In the example above:
+
+- At ≥ 90% congestion for 60 seconds → fees are **10×** the base rate.
+- At ≥ 95% congestion for 60 seconds → fees are **25×** the base rate.
+- At ≥ 99% congestion for 60 seconds → fees are **100×** the base rate.
+
+Both the congestion percentages and the multipliers must strictly increase from left to right. All arithmetic uses integers to guarantee identical results across nodes.
+
+### Disabling congestion pricing
+
+```properties
+fees.percentCongestionMultipliers=1,1x
+```
+
+Setting the multiplier to `1x` at a threshold of `1%` effectively disables congestion pricing — any non-zero congestion triggers a 1× (no-op) multiplier.
+
+Update this property by submitting a `FileUpdate` to system file `0.0.121`. See [Configuration](/operations/configuration) for the full override workflow.
+
+## Custom fees for HTS tokens
+
+Token creators can attach a **custom fee schedule** to a Hedera Token Service (HTS) token. Custom fees are automatically assessed whenever the token is transferred and are paid in addition to the standard Hedera transaction fee.
+
+There are three types of custom fee:
+
+<AccordionGroup>
+  <Accordion title="Fixed fees">
+    A flat amount charged to each account that debits units of the token in a transfer. The fee can be denominated in ℏ or in units of any HTS token (provided the payer is associated with that token).
+
+    **Example:** A token with a fixed fee of 1ℏ means every sender pays 1ℏ to the fee collector account, regardless of how many units they transfer.
+
+    ```
+    assessed_custom_fees {
+      amount: 100000000          # 1ℏ = 100,000,000 tinybars
+      fee_collector_account_id { accountNum: 1017 }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Fractional fees">
+    A fraction of the transferred amount, collected in the same token units. Upper and lower bounds on the charged amount can be set. The fee is not charged separately from the transfer; instead the receiver gets fewer units.
+
+    **Example:** A 1/100 fractional fee with a maximum of 5 units on a 1,000-unit transfer results in 5 units going to the fee collector and 995 units reaching the receiver.
+
+    ```
+    assessed_custom_fees {
+      amount: 5
+      token_id { tokenNum: 1012 }
+      fee_collector_account_id { accountNum: 1011 }
+    }
+    ```
+
+    Fractional fees are **always collected in the transferred token** — never in ℏ or a different HTS token.
+  </Accordion>
+
+  <Accordion title="Royalty fees">
+    Only available on non-fungible tokens (NFTs). Collects a fraction of the fungible value exchanged for the NFT. "Fungible value" includes both ℏ and any HTS fungible tokens received by the NFT sender.
+
+    A **fallback fee** (fixed in ℏ or an HTS token) can be specified for transfers where no fungible value is exchanged. The fallback fee is charged to the **receiver** of the NFT.
+
+    **Example:** A 1/100 royalty on an NFT sold for 1,000ℏ and 200 USDC yields 10ℏ and 2 USDC to the fee collector; the seller receives 990ℏ and 198 USDC.
+  </Accordion>
+</AccordionGroup>
+
+### Fee exemptions
+
+Two accounts are always exempt from custom fees:
+
+- The **treasury** of the token — treasury accounts are never charged custom fees.
+- A **fee collector account** is not charged fractional fees for which it is the collector.
+
+### Nested fees
+
+Custom fee schedules can be nested one level deep. If a custom fee is paid in an HTS token that itself has a custom fee schedule, that nested fee is also assessed. Fee schedules cannot be nested beyond one additional level; an attempt to do so fails with `CUSTOM_FEE_CHARGING_EXCEEDED_MAX_RECURSION_DEPTH`.
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card title="Throttling" icon="gauge" href="/operations/throttling">
+    Understand how bucket throttles protect network capacity and drive congestion pricing.
+  </Card>
+  <Card title="Monitoring" icon="chart-line" href="/operations/monitoring">
+    Observe fee multiplier changes through metrics and record stream files.
+  </Card>
+</CardGroup>
